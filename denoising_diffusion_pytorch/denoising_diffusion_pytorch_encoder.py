@@ -433,12 +433,14 @@ class TrainerMLPEncoder:
         save_best_and_latest_only = False,
         dataset= None,
         z_weight = .001,
-        recon_weight=1.
+        recon_weight=1.,
+        weight_diffusion=1.,
     ):
         super().__init__()
 
         self.z_weight = z_weight
         self.recon_weight = recon_weight
+        self.weight_diffusion = weight_diffusion
         self.out_info = {} # use this to read and write!
 
         # accelerator
@@ -604,7 +606,14 @@ class TrainerMLPEncoder:
 
                     with self.accelerator.autocast():
                         loss = self.model(data)
-                        loss = loss / self.gradient_accumulate_every
+                        loss =  self.weight_diffusion *  loss / self.gradient_accumulate_every
+                        # loss.backward()
+                        # # Check gradients
+                        # for name, param in self.model.named_parameters():
+                        #     if param.grad is not None:
+                        #         print(f"{name} gradient norm {param.grad.norm()}")
+                        # import sys
+                        # sys.exit()
 
                         # recon loss
                         z = self.model.encoder(data)
@@ -619,7 +628,7 @@ class TrainerMLPEncoder:
 
                     self.accelerator.backward(loss)
 
-                pbar.set_description(f'diff loss: {diffusion_loss:.4f} rl: {recon_loss:.4f} total loss {total_loss.item():.4f}')
+                pbar.set_description(f'diff loss: {diffusion_loss:.4f} rl: {recon_loss:.4f} total loss {total_loss:.4f}')
                 
                 # pbar.set_
 
@@ -650,11 +659,21 @@ class TrainerMLPEncoder:
                             batches = num_to_groups(self.num_samples, self.batch_size)
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
 
+                            # lets encode and decode some real data
+                            #import pdb; pdb.set_trace()
+
+                            z = self.model.encoder(data)
+                            x_recon = self.model.decoder(z)
+
                         all_images = torch.cat(all_images_list, dim = 0)
+                        recon_images = x_recon[:self.batch_size]
 
                         fout = str(self.results_folder / f'sample-{milestone}.png')
                         print("saving to", fout)
                         utils.save_image(all_images,fout , nrow = int(math.sqrt(self.num_samples)))
+                        fout = str(self.results_folder / f'recon-{milestone}.png')
+                        print('saving recon images to', fout)
+                        utils.save_image(recon_images, fout, nrow = int(math.sqrt(self.num_samples)))  
 
                         # def plot_data(ax,X):
                         #     XX = X[:,0]

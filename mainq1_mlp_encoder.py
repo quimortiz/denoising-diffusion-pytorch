@@ -209,6 +209,7 @@ trainer = TrainerMLPEncoder(
     calculate_fid = False,              # whether to calculate fid during training
     dataset = tensor_dataset,
     results_folder = results_folder,
+    weight_diffusion=0.1,
     # autonormalize = False
 )
 
