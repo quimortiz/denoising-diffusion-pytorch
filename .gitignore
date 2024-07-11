@@ -3,6 +3,7 @@ results/
 tmp/
 data/
 output
+image_based/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
