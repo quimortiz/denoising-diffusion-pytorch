@@ -33,7 +33,7 @@ from denoising_diffusion_pytorch.version import __version__
 import matplotlib.pyplot as plt
 
 
-from denoising_diffusion_pytorch.denoising_diffusion_pytorch import cosine_beta_schedule, linear_beta_schedule, sigmoid_beta_schedule, default, identity, normalize_to_neg_one_to_one, unnormalize_to_zero_to_one, extract, ModelPrediction, has_int_squareroot, cycle, divisible_by, num_to_groups, exists
+from denoising_diffusion_pytorch.denoising_diffusion_pytorch import cosine_beta_schedule, linear_beta_schedule, sigmoid_beta_schedule, default, identity, normalize_to_neg_one_to_one, unnormalize_to_zero_to_one, extract, ModelPrediction, has_int_squareroot, cycle, divisible_by, num_to_groups, exists, Dataset
     
 
 
@@ -55,13 +55,18 @@ class GaussianDiffusionMLPEncoder(Module):
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
         embed_dim = 32,
+        image_size=64,
         encoder = None,
-        decoder = None
-    ):
+        decoder = None,
+        loss_in_image_space = False,
+):
         super().__init__()
 
         assert encoder is not None, 'encoder must be provided'
         assert decoder is not None, 'decoder must be provided'
+
+        self.loss_in_image_space = loss_in_image_space
+        self.image_size=image_size
 
         # TODO: allow for fixed encoder and decoder -- but this happens in the trainer.
         self.encoder = encoder
@@ -342,7 +347,7 @@ class GaussianDiffusionMLPEncoder(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
+    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None, img_start = None):
         b, nx = x_start.shape
 
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -374,24 +379,46 @@ class GaussianDiffusionMLPEncoder(Module):
                 x_self_cond.detach_()
 
         # predict and take gradient step
-
         model_out = self.model(x, t, x_self_cond)
 
-        if self.objective == 'pred_noise':
-            target = noise
-        elif self.objective == 'pred_x0':
-            target = x_start
-        elif self.objective == 'pred_v':
-            v = self.predict_v(x_start, t, noise)
-            target = v
-        else:
-            raise ValueError(f'unknown objective {self.objective}')
+        if self.loss_in_image_space:
+            if self.objective == 'pred_x0':
+                assert img_start is not None, 'image_start must be provided if loss is in image space'
+                img_pred = self.decoder(model_out)
+                loss = F.mse_loss(img_pred, img_start, reduction='none')
+                loss = reduce(loss, 'b ... -> b', 'mean')
+                loss = loss * extract(self.loss_weight, t, loss.shape)
+                return loss.mean()
+            if self.objective == 'pred_noise':
+                # get back the predicted start
+                pred_noise = model_out
+                x_start = self.predict_start_from_noise(x, t, pred_noise)
+                img_pred = self.decoder(x_start)
+                loss = F.mse_loss(img_pred, img_start, reduction='none')
+                loss = reduce(loss, 'b ... -> b', 'mean')
+                loss = loss * extract(self.loss_weight, t, loss.shape)
+                return loss.mean()
 
-        loss = F.mse_loss(model_out, target, reduction = 'none')
-        loss = reduce(loss, 'b ... -> b', 'mean')
+            else:
+                raise ValueError(f'unknown objective {self.objective}')
 
-        loss = loss * extract(self.loss_weight, t, loss.shape)
-        return loss.mean()
+
+        else: 
+            if self.objective == 'pred_noise':
+                target = noise
+            elif self.objective == 'pred_x0':
+                target = x_start
+            elif self.objective == 'pred_v':
+                v = self.predict_v(x_start, t, noise)
+                target = v
+            else:
+                raise ValueError(f'unknown objective {self.objective}')
+
+            loss = F.mse_loss(model_out, target, reduction = 'none')
+            loss = reduce(loss, 'b ... -> b', 'mean')
+
+            loss = loss * extract(self.loss_weight, t, loss.shape)
+            return loss.mean()
 
     def forward(self, x, *args, **kwargs):
         # b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
@@ -403,7 +430,7 @@ class GaussianDiffusionMLPEncoder(Module):
         img = self.normalize(x)
         # convert to low dim 
         z = self.encoder(img)
-        return self.p_losses(z, t, *args, **kwargs)
+        return self.p_losses(z, t, *args, **kwargs,img_start=img)
 
 class TrainerMLPEncoder:
     def __init__(
@@ -473,7 +500,7 @@ class TrainerMLPEncoder:
 
         self.train_num_steps = train_num_steps
         self.vector_size = diffusion_model.vector_size
-        # self.image_size = diffusion_model.image_size
+        self.image_size = diffusion_model.image_size
 
         self.max_grad_norm = max_grad_norm
 
@@ -588,14 +615,20 @@ class TrainerMLPEncoder:
         out_info = self.out_info
         out_info['loss'] = []
         out_info['recon_loss'] = []
+        out_info['z_loss'] = []
         out_info['diff_loss'] = []
 
+
+
+
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+            #print(self.model.device)
 
             while self.step < self.train_num_steps:
 
                 diffusion_loss = 0.
                 recon_loss = 0.
+                z_loss = 0.
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
@@ -618,19 +651,24 @@ class TrainerMLPEncoder:
                         # recon loss
                         z = self.model.encoder(data)
                         x_recon = self.model.decoder(z)
-                        _recon_loss =   self.recon_weight * (F.mse_loss(x_recon, data)  + self.z_weight * F.mse_loss(z, torch.zeros_like(z))) / self.gradient_accumulate_every
+                        _recon_loss =   self.recon_weight * F.mse_loss(x_recon, data) / self.gradient_accumulate_every
+                        _z_loss =  self.z_weight * F.mse_loss(z, torch.zeros_like(z)) / self.gradient_accumulate_every
 
                         loss += _recon_loss
+                        loss += _z_loss
 
                         diffusion_loss += loss.item()
                         recon_loss += _recon_loss.item()
                         total_loss += loss.item()
+                        z_loss += _z_loss.item()
 
                     self.accelerator.backward(loss)
 
-                pbar.set_description(f'diff loss: {diffusion_loss:.4f} rl: {recon_loss:.4f} total loss {total_loss:.4f}')
+
+                #if self.step % 100 == 0:
                 
-                # pbar.set_
+                pbar.set_description(f'diffusion: {diffusion_loss:.4f} recon: {recon_loss:.4f}  z {z_loss:4f} total loss {total_loss:.4f}')
+                pbar.update(1)
 
 
                 accelerator.wait_for_everyone()
@@ -650,6 +688,7 @@ class TrainerMLPEncoder:
                         out_info['loss'].append(loss.item())
                         out_info['recon_loss'].append(recon_loss)
                         out_info['diff_loss'].append(diffusion_loss)
+                        out_info['z_loss'].append(z_loss)
 
 
                         self.ema.ema_model.eval()
@@ -664,6 +703,8 @@ class TrainerMLPEncoder:
 
                             z = self.model.encoder(data)
                             x_recon = self.model.decoder(z)
+
+                            print("average z norm is", z.norm(dim = 1).mean())
 
                         all_images = torch.cat(all_images_list, dim = 0)
                         recon_images = x_recon[:self.batch_size]
@@ -709,6 +750,5 @@ class TrainerMLPEncoder:
                         else:
                             self.save(milestone)
 
-                pbar.update(1)
 
         accelerator.print('training complete')

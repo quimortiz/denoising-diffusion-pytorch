@@ -34,17 +34,17 @@ import matplotlib.pyplot as plt
 import sys
 sys.path.append( "/home/quim/code/resnet-18-autoencoder/src/")
 
-from classes.resnet_autoencoder import AE
+# from classes.resnet_autoencoder import AE
 
-from scripts.utils import (
-    train_epoch,
-    test_epoch,
-    plot_ae_outputs,
-    plot_ae_interpolations,
-    checkpoint,
-    resume,
-    get_rand_id
-)
+# from scripts.utils import (
+#     train_epoch,
+#     test_epoch,
+#     plot_ae_outputs,
+#     plot_ae_interpolations,
+#     checkpoint,
+#     resume,
+#     get_rand_id
+# )
 
 
 # constants

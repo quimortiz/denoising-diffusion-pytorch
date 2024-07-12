@@ -124,6 +124,8 @@ class CNN_Encoder(nn.Module):
             nn.BatchNorm1d(self.flat_fts),
             nn.LeakyReLU(0.2),
             nn.Linear(self.flat_fts, output_size),
+            nn.Tanh()
+                    #latent_code = torch.tanh(latent_code)
         )
 
     def get_flat_fts(self, fts):
@@ -139,7 +141,10 @@ class CNN_Encoder(nn.Module):
 
 transform = transforms.Compose([
     transforms.Resize((64, 64)),  # Resize images to a fixed size, e.g., 128x128
+    #clamp between .1 and .9
     transforms.ToTensor(),  # Convert images to PyTorch tensors
+        transforms.Lambda(lambda img: img.clamp(0.1, 0.9)),
+
 ])
 
 
@@ -166,7 +171,7 @@ all_labels = torch.cat(all_labels)
 # Create a TensorDataset
 tensor_dataset = TensorDataset(all_images, all_labels)
 
-nx = 16 # hidden dim
+nx = 8 # hidden dim
 model = MLPNet(
     dim =  nx
 )
@@ -179,13 +184,16 @@ decoder = CNN_Decoder(nx,img_size)
 diffusion = GaussianDiffusionMLPEncoder(
     model,
     vector_size = nx,
-    objective = "pred_noise",
-    # image_size = 64,
+    #objective = "pred_noise",
+    #objective = "pred_noise",
+    objective = "pred_x0",
+    image_size = 64,
     beta_schedule = 'cosine',
     timesteps = 100,    # number of steps
     auto_normalize= False,
     encoder = encoder,
-    decoder = decoder
+    decoder = decoder,
+    loss_in_image_space=True
 )
 
 X = diffusion.sample(batch_size=128, return_all_timesteps=False)
@@ -198,19 +206,26 @@ pathlib.Path(results_folder).mkdir(exist_ok=True, parents=True)
 
 trainer = TrainerMLPEncoder(
     diffusion,
-    'tmp/all_img',
+   # 'tmp/all_img',
+    '/home/quim/code/denoising-diffusion-pytorch/tmp/all_img_color_fake_class/class1/',
     train_batch_size = 32,
-    train_lr = 1e-3,
-    train_num_steps = 1000,         # total training steps
+    #ema_update_every=100000,
+    #train_lr = 1e-3,
+    train_lr = 1e-4,
+    train_num_steps = 1000*1000,         # total training steps
     gradient_accumulate_every = 2,    # gradient accumulation steps
-    save_and_sample_every = 100,
+    save_and_sample_every = 2*1000,
     ema_decay = 0.995,                # exponential moving average decay
     amp = False,                       # turn on mixed precision
     calculate_fid = False,              # whether to calculate fid during training
-    dataset = tensor_dataset,
-    results_folder = results_folder,
-    weight_diffusion=0.1,
-    # autonormalize = False
+   # dataset = tensor_dataset,
+   # results_folder = results_folder,
+    augment_horizontal_flip=False,
+    weight_diffusion=10.,
+    z_weight=.001,
+    recon_weight=0.,
+
+   
 )
 
 
@@ -223,7 +238,8 @@ fields = [ 'loss', 'recon_loss' , 'diff_loss']
 for field in fields:
     plt.plot(out_info[field], label=field)
     plt.legend()
-    plt.show()
+    plt.savefig(f"{results_folder}/{field}.png")
+    plt.close()
 
 
 
