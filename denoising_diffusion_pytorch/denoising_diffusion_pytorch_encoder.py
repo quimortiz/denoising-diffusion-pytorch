@@ -59,11 +59,15 @@ class GaussianDiffusionMLPEncoder(Module):
         encoder = None,
         decoder = None,
         loss_in_image_space = False,
+        fix_encoder_decoder=False,
+        z_space_weight = .01
 ):
         super().__init__()
 
         assert encoder is not None, 'encoder must be provided'
         assert decoder is not None, 'decoder must be provided'
+
+        self.z_space_weight = z_space_weight
 
         self.loss_in_image_space = loss_in_image_space
         self.image_size=image_size
@@ -388,8 +392,8 @@ class GaussianDiffusionMLPEncoder(Module):
                 loss = F.mse_loss(img_pred, img_start, reduction='none')
                 loss = reduce(loss, 'b ... -> b', 'mean')
                 loss = loss * extract(self.loss_weight, t, loss.shape)
-                return loss.mean()
-            if self.objective == 'pred_noise':
+                out =  loss.mean()
+            elif self.objective == 'pred_noise':
                 # get back the predicted start
                 pred_noise = model_out
                 x_start = self.predict_start_from_noise(x, t, pred_noise)
@@ -397,12 +401,30 @@ class GaussianDiffusionMLPEncoder(Module):
                 loss = F.mse_loss(img_pred, img_start, reduction='none')
                 loss = reduce(loss, 'b ... -> b', 'mean')
                 loss = loss * extract(self.loss_weight, t, loss.shape)
-                return loss.mean()
+                out =  loss.mean()
 
             else:
                 raise ValueError(f'unknown objective {self.objective}')
+            
+            if self.objective == 'pred_noise':
+                target = noise
+            elif self.objective == 'pred_x0':
+                target = x_start
+            elif self.objective == 'pred_v':
+                v = self.predict_v(x_start, t, noise)
+                target = v
+            else:
+                raise ValueError(f'unknown objective {self.objective}')
 
+            loss = F.mse_loss(model_out, target, reduction = 'none')
+            loss = reduce(loss, 'b ... -> b', 'mean')
 
+            loss = loss * extract(self.loss_weight, t, loss.shape)
+            error_in_z = self.z_space_weight * loss.mean()
+
+            #print('error in z', error_in_z, 'error in image', out )
+            out += error_in_z
+            return out
         else: 
             if self.objective == 'pred_noise':
                 target = noise
@@ -462,6 +484,7 @@ class TrainerMLPEncoder:
         z_weight = .001,
         recon_weight=1.,
         weight_diffusion=1.,
+        fix_encoder_decoder=False
     ):
         super().__init__()
 
@@ -522,7 +545,16 @@ class TrainerMLPEncoder:
 
         # optimizer
 
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+        params = []
+
+        if fix_encoder_decoder:
+            params = diffusion_model.model.parameters()
+
+        else:
+            params = diffusion_model.parameters()
+    
+
+        self.opt = Adam(params, lr = train_lr, betas = adam_betas)
 
         # for logging results in a folder periodically
 

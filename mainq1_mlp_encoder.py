@@ -185,10 +185,10 @@ diffusion = GaussianDiffusionMLPEncoder(
     model,
     vector_size = nx,
     #objective = "pred_noise",
-    #objective = "pred_noise",
-    objective = "pred_x0",
+    objective = "pred_noise",
+    #objective = "pred_x0",
     image_size = 64,
-    beta_schedule = 'cosine',
+    beta_schedule = 'sigmoid',
     timesteps = 100,    # number of steps
     auto_normalize= False,
     encoder = encoder,
@@ -221,7 +221,7 @@ trainer = TrainerMLPEncoder(
    # dataset = tensor_dataset,
    # results_folder = results_folder,
     augment_horizontal_flip=False,
-    weight_diffusion=10.,
+    weight_diffusion=1.,
     z_weight=.001,
     recon_weight=0.,
 
