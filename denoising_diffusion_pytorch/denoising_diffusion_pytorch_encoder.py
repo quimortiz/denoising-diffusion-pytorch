@@ -60,14 +60,19 @@ class GaussianDiffusionMLPEncoder(Module):
         decoder = None,
         loss_in_image_space = False,
         fix_encoder_decoder=False,
-        z_space_weight = .01
+        z_space_weight = .01,
+        clip_denoised = True
 ):
         super().__init__()
 
         assert encoder is not None, 'encoder must be provided'
         assert decoder is not None, 'decoder must be provided'
 
+        self.clip_denoised = clip_denoised
+
         self.z_space_weight = z_space_weight
+        self.fix_encoder_decoder = fix_encoder_decoder
+        
 
         self.loss_in_image_space = loss_in_image_space
         self.image_size=image_size
@@ -247,7 +252,7 @@ class GaussianDiffusionMLPEncoder(Module):
     def p_sample(self, x, t: int, x_self_cond = None):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = self.clip_denoised)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
@@ -452,6 +457,7 @@ class GaussianDiffusionMLPEncoder(Module):
         img = self.normalize(x)
         # convert to low dim 
         z = self.encoder(img)
+        assert 'img_start' not in kwargs, 'img_start should not be passed as a keyword argument'
         return self.p_losses(z, t, *args, **kwargs,img_start=img)
 
 class TrainerMLPEncoder:
@@ -484,9 +490,12 @@ class TrainerMLPEncoder:
         z_weight = .001,
         recon_weight=1.,
         weight_diffusion=1.,
-        fix_encoder_decoder=False
+        fix_encoder_decoder=False,
+        tb_writer = None
     ):
         super().__init__()
+
+        self.tb_writer = tb_writer
 
         self.z_weight = z_weight
         self.recon_weight = recon_weight
@@ -650,7 +659,8 @@ class TrainerMLPEncoder:
         out_info['z_loss'] = []
         out_info['diff_loss'] = []
 
-
+        counter_writer = 0
+        image_counter = 0
 
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
@@ -701,7 +711,11 @@ class TrainerMLPEncoder:
                 
                 pbar.set_description(f'diffusion: {diffusion_loss:.4f} recon: {recon_loss:.4f}  z {z_loss:4f} total loss {total_loss:.4f}')
                 pbar.update(1)
-
+                if self.step % 100 == 0:
+                    counter_writer += 1
+                    self.tb_writer.add_scalar('diffusion loss', diffusion_loss , counter_writer) 
+                    self.tb_writer.add_scalar('recon loss', recon_loss, counter_writer )
+                    self.tb_writer.add_scalar('z loss', z_loss / 100, counter_writer)
 
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -736,6 +750,7 @@ class TrainerMLPEncoder:
                             z = self.model.encoder(data)
                             x_recon = self.model.decoder(z)
 
+                            print("max z is", z.max() , "min z is", z.min())
                             print("average z norm is", z.norm(dim = 1).mean())
 
                         all_images = torch.cat(all_images_list, dim = 0)
@@ -747,6 +762,18 @@ class TrainerMLPEncoder:
                         fout = str(self.results_folder / f'recon-{milestone}.png')
                         print('saving recon images to', fout)
                         utils.save_image(recon_images, fout, nrow = int(math.sqrt(self.num_samples)))  
+
+
+                        #self.tb_writer.add_image('sample_images', all_images, image_counter)
+                        #self.tb_writer.add_image('recon_images', recon_images, image_counter)
+
+                        # Log images to TensorBoard
+                        self.tb_writer.add_image('sample_images', utils.make_grid(all_images, nrow=int(math.sqrt(self.num_samples))), image_counter)
+                        self.tb_writer.add_image('recon_images', utils.make_grid(recon_images, nrow=int(math.sqrt(self.num_samples))), image_counter)
+
+
+
+                        image_counter += 1
 
                         # def plot_data(ax,X):
                         #     XX = X[:,0]

@@ -22,6 +22,8 @@ from ema_pytorch import EMA
 from tqdm.auto import tqdm
 
 from denoising_diffusion_pytorch.version import __version__
+from torchvision import utils
+
 
 # constants
 
@@ -74,7 +76,8 @@ def unnormalize_to_zero_to_one(t):
 class Dataset1D(Dataset):
     def __init__(self, tensor: Tensor):
         super().__init__()
-        self.tensor = tensor.clone()
+        #self.tensor = tensor.clone()
+        self.tensor = tensor
 
     def __len__(self):
         return len(self.tensor)
@@ -425,15 +428,22 @@ class GaussianDiffusion1D(Module):
         ddim_sampling_eta = 0.,
         auto_normalize = True,
         encoder = None,
-        decoder = None
+        decoder = None,
+        loss_image_space = True,
+        z_diff = 1.,
+        image_weight = 1.,
     ):
         super().__init__()
-        self.model = model
-        self.channels = self.model.channels
-        self.self_condition = self.model.self_condition
 
         self.encoder = encoder
         self.decoder = decoder
+        self.loss_image_space = loss_image_space
+        self.image_weight = image_weight
+        self.z_diff = z_diff
+
+        self.model = model
+        self.channels = self.model.channels
+        self.self_condition = self.model.self_condition
 
         self.seq_length = seq_length
 
@@ -594,6 +604,7 @@ class GaussianDiffusion1D(Module):
 
         img = torch.randn(shape, device=device)
 
+
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
@@ -601,6 +612,15 @@ class GaussianDiffusion1D(Module):
             img, x_start = self.p_sample(img, t, self_cond)
 
         img = self.unnormalize(img)
+        # use the decoder to map
+        # b c n 
+        # into
+        # b n c h w
+        img = rearrange(img, 'b c n -> b n c')
+        img = rearrange(img, 'b n c -> (b n) c')
+        img = self.decoder(img)
+        img = rearrange(img, '(b n) c h w -> b n c h w', b = batch)
+
         return img
 
     @torch.no_grad()
@@ -674,7 +694,7 @@ class GaussianDiffusion1D(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None):
+    def p_losses(self, x_start, t, noise = None, seq_img = None):
         b, c, n = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -710,17 +730,64 @@ class GaussianDiffusion1D(Module):
         loss = reduce(loss, 'b ... -> b', 'mean')
 
         loss = loss * extract(self.loss_weight, t, loss.shape)
-        return loss.mean()
+        out =  self.z_diff * loss.mean()
+
+        if self.loss_image_space:
+            if self.objective == 'pred_v':
+                x_start = self.predict_start_from_v(x, t, target)
+            elif self.objective == 'pred_x0':
+                x_start = target
+            elif self.objective == 'pred_noise':
+                x_start = self.predict_start_from_noise(x, t, target)
+            
+            _x_start = rearrange(x_start, 'b c n -> b n c')
+            _x_start = rearrange(_x_start, 'b n c -> (b n) c')
+
+
+            img_start = self.decoder(_x_start)
+
+            
+            loss = F.mse_loss(img_start, seq_img, reduction = 'none')
+            # back to seq
+            loss = rearrange(loss, '(b n) c h w -> b n c h w', b = b)
+            loss = reduce(loss, 'b ... -> b', 'mean')
+            loss = loss * extract(self.loss_weight, t, loss.shape)
+            #print('loss before' , out)
+            out += self.image_weight * loss.mean()
+            #print('loss after')
+            #print(out)
+
+
+
+        return out
 
     def forward(self, img, *args, **kwargs):
-        b, c, n, device, seq_length, = *img.shape, img.device, self.seq_length
+
+        # Input is:
+        # Batch x seq length x channels x height x width
+
+        # i want to use encoder to map channels x height x width into c
+
+        _img = rearrange(img, 'b n c h w -> (b n) c h w')
+        _z = self.encoder(_img)
+        _z = rearrange(_z, '(b n) z -> b n z', b = img.shape[0])
+
+        # now i want, 
+        # batch x z x seq length
+        _z = rearrange(_z, 'b n z -> b z n')
+
+        b, c, n, device, seq_length, = *_z.shape, _z.device, self.seq_length
         assert n == seq_length, f'seq length must be {seq_length}'
+        
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        _z = self.normalize(_z)
+        return self.p_losses(_z, t, *args, **kwargs, seq_img = _img)
 
 # trainer class
+
+# image data is: 
+# Batch x seq length x channels x height x width
 
 class Trainer1D(object):
     def __init__(
@@ -740,12 +807,18 @@ class Trainer1D(object):
         results_folder = './results',
         amp = False,
         mixed_precision_type = 'fp16',
-        split_batches = True,
-        max_grad_norm = 1.
-    ):
+        split_batches = False,
+        max_grad_norm = 1.,
+        recon_weight = 1. ,
+        z_weight = 0.
+):
         super().__init__()
 
         # accelerator
+
+        self.recon_weight = recon_weight
+        self.z_weight = z_weight
+
 
         self.accelerator = Accelerator(
             split_batches = split_batches,
@@ -771,10 +844,10 @@ class Trainer1D(object):
 
         # dataset and dataloader
 
-        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
-
-        dl = self.accelerator.prepare(dl)
+        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = False, num_workers = 4)
         self.dl = cycle(dl)
+        #dl = self.accelerator.prepare(dl)
+        #self.dl = cycle(dl)
 
         # optimizer
 
@@ -785,6 +858,8 @@ class Trainer1D(object):
         if self.accelerator.is_main_process:
             self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
             self.ema.to(self.device)
+            
+            
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
@@ -840,50 +915,111 @@ class Trainer1D(object):
         accelerator = self.accelerator
         device = accelerator.device
 
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+        
 
-            while self.step < self.train_num_steps:
-                self.model.train()
+        #with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+        import time
+        time_start = time.time()
+        while self.step < self.train_num_steps:
+            self.model.train()
 
-                total_loss = 0.
+            total_loss = 0.
 
-                for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
+            for _ in range(self.gradient_accumulate_every):
+                data = next(self.dl).to(device)
 
-                    with self.accelerator.autocast():
-                        loss = self.model(data)
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
 
-                    self.accelerator.backward(loss)
+                # _data = rearrange(data, 'b n c h w -> (b n) c h w')
+                # fout = str(self.results_folder / f'original-x.png')
+                # print(f'saving to {fout}')
+                # utils.save_image(_data,fout , nrow = self.batch_size)
+                # sys.exit()
 
-                pbar.set_description(f'loss: {total_loss:.4f}')
+                
 
-                accelerator.wait_for_everyone()
-                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                self.opt.step()
-                self.opt.zero_grad()
+                with self.accelerator.autocast():
+                    loss = self.model(data)
+                    loss = loss / self.gradient_accumulate_every
+                    total_loss += loss.item()
 
-                accelerator.wait_for_everyone()
+                    # add recon loss
+                    _data = rearrange(data, 'b n c h w -> (b n) c h w')
+                    _z = self.model.encoder(_data)
+                    _data_fake = self.model.decoder(_z)
+                    recon_loss = self.recon_weight * F.mse_loss(_data_fake, _data,reduction="mean") / self.gradient_accumulate_every
+                    z_loss = self.z_weight * F.mse_loss(_z, torch.zeros_like(_z) , reduction="mean") / self.gradient_accumulate_every
+                    loss += recon_loss + z_loss
 
-                self.step += 1
-                if accelerator.is_main_process:
-                    self.ema.update()
 
-                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                        self.ema.ema_model.eval()
+                self.accelerator.backward(loss)
 
-                        with torch.no_grad():
-                            milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+            
+            if self.step % 1000 == 0:
+                print( f"Step: {self.step}/{self.train_num_steps} loss: {total_loss:.5f}" \
+                                        f" recon_loss: {recon_loss:.5f}" \
+                                            f" z_loss: {z_loss:.5f} " \
+                                            f" ET: { (time.time() - time_start) / (self.step+1) * (self.train_num_steps - self.step) / 3600} hours")
 
-                        all_samples = torch.cat(all_samples_list, dim = 0)
+            accelerator.wait_for_everyone()
+            accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                        torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
-                        self.save(milestone)
+            self.opt.step()
+            self.opt.zero_grad()
 
-                pbar.update(1)
+            accelerator.wait_for_everyone()
+
+            self.step += 1
+            if accelerator.is_main_process:
+                self.ema.update()
+
+                if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                #if True: 
+                    self.ema.ema_model.eval()
+                    #self.model.eval()
+
+                    with torch.no_grad():
+                        milestone = self.step // self.save_and_sample_every
+                        batches = num_to_groups(self.num_samples, self.batch_size)
+                        all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                        #all_samples_list = list(map(lambda n: self.model.sample(batch_size=n), batches))
+
+                    batch_size = self.batch_size
+
+                    all_samples = torch.cat(all_samples_list, dim = 0)
+                    seq_length = all_samples.shape[1]
+                    all_samples = rearrange(all_samples, 'b n c h w -> (b n) c h w')
+                    fout = str(self.results_folder / f'sample-{milestone}.png')
+                    print(f'saving to {fout}')
+                    utils.save_image(all_samples,fout , nrow = seq_length)
+
+                    _data = rearrange(data, 'b n c h w -> (b n) c h w')
+                    fout = str(self.results_folder / f'original-{milestone}.png')
+                    print(f'saving to {fout}')
+                    utils.save_image(_data,fout , nrow = seq_length)
+
+                    # lets reconstruct the data
+                    _z = self.model.encoder(_data)
+                    _data_fake = self.model.decoder(_z)
+                    # print the average norm
+                    print(f'average norm of z {_z.norm(dim=1).mean()}')
+                    fout = str(self.results_folder / f'recon-{milestone}.png')
+                    print(f'saving to {fout}')
+                    utils.save_image(_data_fake,fout , nrow = seq_length)
+
+
+                    
+
+
+
+
+
+
+                    #torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+
+
+                    self.save(milestone)
+
+            #pbar.update(1)
 
         accelerator.print('training complete')

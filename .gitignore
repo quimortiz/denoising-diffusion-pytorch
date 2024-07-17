@@ -4,6 +4,8 @@ tmp/
 data/
 output
 image_based/
+tb/
+*.zip
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

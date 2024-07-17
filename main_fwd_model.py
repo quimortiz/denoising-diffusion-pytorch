@@ -194,7 +194,7 @@ if load_data:
             datapoints.append(datapoint)
 
         trajectory = {}
-        trajectory = {'x': torch.tensor(dd['states']), 'u': torch.tensor(dd['controls'])}
+        trajectory = {'x': torch.tensor(dd['statefix_encoder_decoders']), 'u': torch.tensor(dd['controls'])}
 
         imgs = []
         for img_path in dd['images']:
@@ -251,6 +251,25 @@ class CustomDataset(Dataset):
             'img': datapoint['img'],
             'img_next': datapoint['img_next']
         }
+    
+class CustomDataset2(Dataset):
+    def __init__(self, datapoints, device):
+        self.datapoints = []
+        self.device = device
+        for datapoint in datapoints:
+            self.datapoints.append({
+                'x': datapoint['x'].to(self.device),
+                'xnext': datapoint['xnext'].to(self.device),
+                'u': datapoint['u'].to(self.device),
+                'img': datapoint['img'].to(self.device),
+                'img_next': datapoint['img_next'].to(self.device)
+            })
+
+    def __len__(self):
+        return len(self.datapoints)
+
+    def __getitem__(self, idx):
+        return self.datapoints[idx]
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -260,8 +279,11 @@ print('device: ', device)
 
 batch_size = 64
 
+#TODO: send the datapoints to the gpu!
+
 dataset = CustomDataset(datapoints,device)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+#dataset = CustomDataset2(datapoints,device)
+dataloader = DataLoader(dataset, batch_size=batch_size,num_workers=4, shuffle=True)
 
 
 
@@ -293,7 +315,7 @@ z_weight = .0001
 recon_weight = .1
 recon_weight_next = 1.
 
-data_out = {'img_next_loss': [], 'z_loss': [] , 'img_loss': []}
+data_out = {'img_next_loss': [], 'z_loss': [] , 'img_loss': [] , 'znext_loss': []}
 
 import random
 import string
@@ -349,12 +371,14 @@ local_vars = locals()
 print_all_memory_usage(local_vars)
 
 
+z_next_weight = 1.0
+
 
 
 
 
 for epoch in tqdm.tqdm(range(num_epochs)):
-    epoch_loss = {'img_next_loss': 0, 'z_loss': 0 , 'img_loss': 0}
+    epoch_loss = {'img_next_loss': 0, 'z_loss': 0 , 'img_loss': 0 , 'znext_loss': 0}
     batch_counter = 0 
 
     for batch in dataloader:
@@ -362,17 +386,29 @@ for epoch in tqdm.tqdm(range(num_epochs)):
         decoder.train()
         fwd_model.train()
         opt.zero_grad()
-        #x = batch['x']
-        #xnext = batch['xnext']
+
+
         u = batch['u'].to(device)
         img = batch['img'].to(device)
         img_next = batch['img_next'].to(device)
+
+        # u = batch['u']
+        # img = batch['img']
+        # img_next = batch['img_next']
+
+
         z = encoder(img)
         xnext = fwd_model(z,u)
         img_next_recon = decoder(xnext)
 
         img_next_loss = recon_weight_next * loss_fn(img_next_recon, img_next)
         z_loss = z_weight * (z * z).mean()
+
+        znext_real = encoder(img_next)
+       
+
+        znext_loss = z_next_weight * loss_fn(xnext, znext_real)
+
 
 
         img_recon = decoder(z)
@@ -381,8 +417,9 @@ for epoch in tqdm.tqdm(range(num_epochs)):
         epoch_loss['img_next_loss'] += img_next_loss.item()
         epoch_loss['z_loss'] += z_loss.item()
         epoch_loss['img_loss'] += img_loss.item()
+        epoch_loss['znext_loss'] += znext_loss.item()
 
-        loss = img_next_loss + z_loss + img_loss
+        loss = img_next_loss + z_loss + img_loss + znext_loss
        
         batch_counter += 1
         loss.backward()
@@ -391,6 +428,7 @@ for epoch in tqdm.tqdm(range(num_epochs)):
     data_out['img_next_loss'].append(epoch_loss['img_next_loss']/batch_counter)
     data_out['z_loss'].append(epoch_loss['z_loss']/batch_counter)
     data_out['img_loss'].append(epoch_loss['img_loss']/batch_counter)
+    data_out['znext_loss'].append(epoch_loss['znext_loss']/batch_counter)
 
 
     if epoch % 10 == 0:
@@ -399,7 +437,7 @@ for epoch in tqdm.tqdm(range(num_epochs)):
         decoder.eval()
         fwd_model.eval()
 
-        print(f'Epoch {epoch}, img_next_loss: {epoch_loss["img_next_loss"]/batch_counter}, img_loss: {epoch_loss["img_loss"]/batch_counter}, z_loss: {epoch_loss["z_loss"]/batch_counter}')
+        print(f'Epoch {epoch}, img_next_loss: {epoch_loss["img_next_loss"]/batch_counter}, img_loss: {epoch_loss["img_loss"]/batch_counter}, z_loss: {epoch_loss["z_loss"]/batch_counter} z_next_loss: {epoch_loss["znext_loss"]/batch_counter}')
 
         # plot the losses:
         plt.plot(data_out['img_next_loss'], label='img_next_loss')
