@@ -274,7 +274,8 @@ class Unet1D(Module):
         learned_sinusoidal_dim = 16,
         sinusoidal_pos_emb_theta = 10000,
         attn_dim_head = 32,
-        attn_heads = 4
+        attn_heads = 4,
+        y_cond = None
     ):
         super().__init__()
 
@@ -309,6 +310,13 @@ class Unet1D(Module):
             nn.GELU(),
             nn.Linear(time_dim, time_dim)
         )
+
+        if y_cond is not None: 
+
+            self.y_mlp = nn.Sequential(
+                nn.Linear(channels, time_dim),
+                nn.GELU(),
+                nn.Linear(time_dim, time_dim))
 
         resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
 
@@ -349,7 +357,7 @@ class Unet1D(Module):
         self.final_res_block = resnet_block(init_dim * 2, init_dim)
         self.final_conv = nn.Conv1d(init_dim, self.out_dim, 1)
 
-    def forward(self, x, time, x_self_cond = None):
+    def forward(self, x, time, x_self_cond = None, y = None):
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
@@ -357,7 +365,12 @@ class Unet1D(Module):
         x = self.init_conv(x)
         r = x.clone()
 
-        t = self.time_mlp(time)
+        if y is not None:
+            t = self.time_mlp(time) + self.y_mlp(y)
+        else:
+            t = self.time_mlp(time)
+
+       
 
         h = []
 
@@ -554,8 +567,8 @@ class GaussianDiffusion1D(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond)
+    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False , y = None):
+        model_output = self.model(x, t, x_self_cond, y = y)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -579,8 +592,8 @@ class GaussianDiffusion1D(Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
+    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True , y = None):
+        preds = self.model_predictions(x, t, x_self_cond , y = y)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -590,16 +603,16 @@ class GaussianDiffusion1D(Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, x_self_cond = None, clip_denoised = True):
+    def p_sample(self, x, t: int, x_self_cond = None, clip_denoised = True , y = None):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = clip_denoised)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = clip_denoised , y = y)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, shape):
+    def p_sample_loop(self, shape , y = None):
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device=device)
@@ -609,7 +622,7 @@ class GaussianDiffusion1D(Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
+            img, x_start = self.p_sample(img, t, self_cond , y = y)
 
         img = self.unnormalize(img)
         # use the decoder to map
@@ -660,10 +673,14 @@ class GaussianDiffusion1D(Module):
         return img
 
     @torch.no_grad()
-    def sample(self, batch_size = 16):
+    def sample(self, batch_size = 16 , y = None):
         seq_length, channels = self.seq_length, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, seq_length))
+
+        if y  is not None:
+            y = self.encoder(y)
+
+        return sample_fn((batch_size, channels, seq_length), y=y)
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -694,13 +711,13 @@ class GaussianDiffusion1D(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None, seq_img = None):
+    def p_losses(self, x_start, t, noise = None, seq_img = None , y = None):
         b, c, n = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
 
-        x = self.q_sample(x_start = x_start, t = t, noise = noise)
+        x = self.q_sample(x_start = x_start, t = t, noise = noise )
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
         # and condition with unet with that
@@ -714,7 +731,7 @@ class GaussianDiffusion1D(Module):
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        model_out = self.model(x, t, x_self_cond, y = y)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -761,7 +778,7 @@ class GaussianDiffusion1D(Module):
 
         return out
 
-    def forward(self, img, *args, **kwargs):
+    def forward(self, img, y = None,  *args, **kwargs):
 
         # Input is:
         # Batch x seq length x channels x height x width
@@ -771,6 +788,9 @@ class GaussianDiffusion1D(Module):
         _img = rearrange(img, 'b n c h w -> (b n) c h w')
         _z = self.encoder(_img)
         _z = rearrange(_z, '(b n) z -> b n z', b = img.shape[0])
+
+        if y is not None:
+            y = self.encoder(y)
 
         # now i want, 
         # batch x z x seq length
@@ -782,7 +802,7 @@ class GaussianDiffusion1D(Module):
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         _z = self.normalize(_z)
-        return self.p_losses(_z, t, *args, **kwargs, seq_img = _img)
+        return self.p_losses(_z, t, *args, **kwargs, y = y,  seq_img = _img)
 
 # trainer class
 
@@ -810,7 +830,8 @@ class Trainer1D(object):
         split_batches = False,
         max_grad_norm = 1.,
         recon_weight = 1. ,
-        z_weight = 0.
+        z_weight = 0., 
+        y_cond = False
 ):
         super().__init__()
 
@@ -819,6 +840,7 @@ class Trainer1D(object):
         self.recon_weight = recon_weight
         self.z_weight = z_weight
 
+        self.y_cond = y_cond
 
         self.accelerator = Accelerator(
             split_batches = split_batches,
@@ -939,7 +961,11 @@ class Trainer1D(object):
 
 
                 with self.accelerator.autocast():
-                    loss = self.model(data)
+
+                    if not self.y_cond : 
+                        loss = self.model(data)
+                    else: 
+                        loss = self.model(data, y = data[:,0,:,:,:])
                     loss = loss / self.gradient_accumulate_every
                     total_loss += loss.item()
 
@@ -947,7 +973,11 @@ class Trainer1D(object):
                     _data = rearrange(data, 'b n c h w -> (b n) c h w')
                     _z = self.model.encoder(_data)
                     _data_fake = self.model.decoder(_z)
-                    recon_loss = self.recon_weight * F.mse_loss(_data_fake, _data,reduction="mean") / self.gradient_accumulate_every
+                    if self.y_cond : 
+                        assert self.recon_weight < 1e-12 , 'recon weight should be zero'
+                        recon_loss = 0.
+                    else:
+                        recon_loss = self.recon_weight * F.mse_loss(_data_fake, _data,reduction="mean") / self.gradient_accumulate_every
                     z_loss = self.z_weight * F.mse_loss(_z, torch.zeros_like(_z) , reduction="mean") / self.gradient_accumulate_every
                     loss += recon_loss + z_loss
 
@@ -956,7 +986,7 @@ class Trainer1D(object):
 
             
             if self.step % 1000 == 0:
-                print( f"Step: {self.step}/{self.train_num_steps} loss: {total_loss:.5f}" \
+                print( f"Step: {self.step}/{self.train_num_steps} [{self.step/self.train_num_steps*100:.1f}%] loss: {total_loss:.5f}" \
                                         f" recon_loss: {recon_loss:.5f}" \
                                             f" z_loss: {z_loss:.5f} " \
                                             f" ET: { (time.time() - time_start) / (self.step+1) * (self.train_num_steps - self.step) / 3600} hours")
@@ -977,16 +1007,26 @@ class Trainer1D(object):
                 #if True: 
                     self.ema.ema_model.eval()
                     #self.model.eval()
+                    n = 16
 
                     with torch.no_grad():
                         milestone = self.step // self.save_and_sample_every
                         batches = num_to_groups(self.num_samples, self.batch_size)
-                        all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                        #all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n , y = None if not self.y_cond else data[:,0,:,:,:]), batches))
+                        all_samples = self.ema.ema_model.sample(batch_size=n , y = None if not self.y_cond else data[:n,0,:,:,:])
+
+                        if self.y_cond:
+                            # we take 4 first samples, and use that as conditioning.
+                            _y = data[:4,0,:,:,:]
+                            _y = _y.repeat_interleave(4, dim=0)
+                            all_samples_cond = self.ema.ema_model.sample(batch_size=n , y = _y)
+                            # we repeat them so that we have [s1,s1,s1,s1 , s2,s2,s2,s2, ...]
+
                         #all_samples_list = list(map(lambda n: self.model.sample(batch_size=n), batches))
 
                     batch_size = self.batch_size
 
-                    all_samples = torch.cat(all_samples_list, dim = 0)
+                    #all_samples = torch.cat(all_samples_list, dim = 0)
                     seq_length = all_samples.shape[1]
                     all_samples = rearrange(all_samples, 'b n c h w -> (b n) c h w')
                     fout = str(self.results_folder / f'sample-{milestone}.png')
@@ -1006,6 +1046,12 @@ class Trainer1D(object):
                     fout = str(self.results_folder / f'recon-{milestone}.png')
                     print(f'saving to {fout}')
                     utils.save_image(_data_fake,fout , nrow = seq_length)
+
+                    if self.y_cond:
+                        all_samples_cond = rearrange(all_samples_cond, 'b n c h w -> (b n) c h w')
+                        fout = str(self.results_folder / f'sample-cond-{milestone}.png')
+                        print(f'saving to {fout}')
+                        utils.save_image(all_samples_cond,fout , nrow = seq_length)
 
 
                     

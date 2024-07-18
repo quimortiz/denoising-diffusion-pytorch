@@ -23,15 +23,21 @@ def generate_exp_id():
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--exp_id', type=str, default=generate_exp_id())
-parser.add_argument('--pretrained', type=int, default=0)
+parser.add_argument('--pretrained', action='store_true')
 parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--recon_weight', type=float, default=.0)
 parser.add_argument('--z_weight', type=float, default=1e-5)
 parser.add_argument('--z_diff', type=float, default=1e-5)
+parser.add_argument('--cond', action='store_true')
+parser.add_argument('--size', type=int, default=32)
 
 
 args = parser.parse_args()
-pretrained = bool(args.pretrained)
+print(args)
+
+#args.size = 64
+
+#args.cond = True
 
 
 
@@ -50,6 +56,7 @@ pretrained = bool(args.pretrained)
 
 batch = 1024
 w = 64
+
 h = 64
 c = 3
 n = 16
@@ -67,17 +74,22 @@ with open(folder_name + 'trajectories.pkl', 'rb') as f:
     print('data has been loaded with pickle!')
 
 my_data = torch.stack( [ traj['imgs'] for traj in trajectories] )
+del trajectories
 import torch.nn.functional as F
 
 # Slice the tensor to take one every two elements
 my_data_reduced = my_data[:, ::2, :, :, :]
 
 
-my_data_resized = torch.stack( [
-F.interpolate(traj, size=(32, 32), mode='bilinear', align_corners=False) for traj in my_data_reduced
-])
+if args.size == 32:
 
-
+    my_data_resized = torch.stack( [
+    F.interpolate(traj, size=(32, 32), mode='bilinear', align_corners=False) for traj in my_data_reduced
+    ])
+elif args.size == 64:
+    my_data_resized = my_data_reduced
+else:
+    raise ValueError('only 32 and 64 are supported')
 
 
 
@@ -85,14 +97,14 @@ F.interpolate(traj, size=(32, 32), mode='bilinear', align_corners=False) for tra
 
 
 # del datapoints
-del trajectories
 
 
 
 
 
-vision_model = VanillaVAE(in_channels=3, latent_dims=8)
-if pretrained:
+
+vision_model = VanillaVAE(in_channels=3, latent_dims=8 , size = args.size)
+if args.pretrained:
     path = '/home/quim/code/Conv-VAE-PyTorch/output/ZIN9X2/state_dict_ZIN9X2_e09900.pth'
     vision_model.load_state_dict(torch.load(path))
 
@@ -101,7 +113,8 @@ if pretrained:
 model = Unet1D(
     dim = 32,
     dim_mults = (1, 2, 4),
-    channels = 8
+    channels = 8, 
+    y_cond = args.cond
 )
 
 class VAEencoder(nn.Module):
@@ -153,11 +166,13 @@ trainer = Trainer1D(
     train_lr = args.lr,
     train_num_steps = 700000,         # total training steps
     gradient_accumulate_every = 1,    # gradient accumulation steps
+    save_and_sample_every = 1000,
     ema_decay = 0.995,                # exponential moving average decay
     amp = True,                       # turn on mixed precision
     results_folder= f"./results/{args.exp_id}/",
     recon_weight=args.recon_weight,
-    z_weight=args.z_weight
+    z_weight=args.z_weight,
+    y_cond = args.cond
 )
 trainer.train()
 
