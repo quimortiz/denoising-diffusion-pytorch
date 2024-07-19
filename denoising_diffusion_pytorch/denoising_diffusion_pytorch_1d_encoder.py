@@ -23,6 +23,7 @@ from tqdm.auto import tqdm
 
 from denoising_diffusion_pytorch.version import __version__
 from torchvision import utils
+from torch.optim.lr_scheduler import LambdaLR
 
 
 # constants
@@ -673,14 +674,16 @@ class GaussianDiffusion1D(Module):
         return img
 
     @torch.no_grad()
-    def sample(self, batch_size = 16 , y = None):
+    def sample(self, batch_size = 16 , y = None, set_y_to_0 = False):
         seq_length, channels = self.seq_length, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
 
         if y  is not None:
             y = self.encoder(y)
+        if set_y_to_0:
+            y = torch.zeros(batch_size, seq_length).to(self.model.device)
 
-        return sample_fn((batch_size, channels, seq_length), y=y)
+        return sample_fn((batch_size, channels, seq_length), y=y )
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -778,19 +781,23 @@ class GaussianDiffusion1D(Module):
 
         return out
 
-    def forward(self, img, y = None,  *args, **kwargs):
+    def forward(self, img, y = None, set_y_to_0 = False,  *args, **kwargs):
 
         # Input is:
         # Batch x seq length x channels x height x width
 
         # i want to use encoder to map channels x height x width into c
-
+        batch_size = img.shape[0]
+        seq_length = img.shape[1]
         _img = rearrange(img, 'b n c h w -> (b n) c h w')
         _z = self.encoder(_img)
         _z = rearrange(_z, '(b n) z -> b n z', b = img.shape[0])
 
         if y is not None:
             y = self.encoder(y)
+
+        if set_y_to_0:
+                y = torch.zeros(batch_size, seq_length).to(_z.device)
 
         # now i want, 
         # batch x z x seq length
@@ -831,7 +838,10 @@ class Trainer1D(object):
         max_grad_norm = 1.,
         recon_weight = 1. ,
         z_weight = 0., 
-        y_cond = False
+        y_cond = False, 
+        mod_lr = True,
+        cond_combined = False, # for z=0, this should be an unconditional model
+
 ):
         super().__init__()
 
@@ -839,6 +849,8 @@ class Trainer1D(object):
 
         self.recon_weight = recon_weight
         self.z_weight = z_weight
+        self.mod_lr = mod_lr
+        self.cond_combined = cond_combined
 
         self.y_cond = y_cond
 
@@ -937,11 +949,33 @@ class Trainer1D(object):
         accelerator = self.accelerator
         device = accelerator.device
 
+
+        # Define the learning rate lambda function
+        def lr_lambda(step):
+            if step < 10000:
+                return 1 + (step / 10000) * 9  # linear increase from 1 to 10
+            elif step < 100000:
+                return 10 - ((step - 10000) / 90000) * 9  # linear decrease from 10 to 1
+            else:
+                return 1
+            
+        def lr_fixed(step):
+            return 1
+
+
         
 
         #with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
         import time
         time_start = time.time()
+
+        if self.mod_lr:
+            scheduler = LambdaLR(self.opt, lr_lambda)
+        else:
+            scheduler = LambdaLR(self.opt, lr_fixed)
+
+
+      
         while self.step < self.train_num_steps:
             self.model.train()
 
@@ -965,7 +999,15 @@ class Trainer1D(object):
                     if not self.y_cond : 
                         loss = self.model(data)
                     else: 
-                        loss = self.model(data, y = data[:,0,:,:,:])
+                        if self.cond_combined:
+                            # randomnly set the condition to zero
+                            if random() < 0.5:
+                                loss = self.model(data, y = data[:,0,:,:,:])
+                            else:
+                                loss = self.model(data,set_y_to_0 = True)
+                        else:
+                            loss = self.model(data, y = data[:,0,:,:,:])
+                        
                     loss = loss / self.gradient_accumulate_every
                     total_loss += loss.item()
 
@@ -989,12 +1031,14 @@ class Trainer1D(object):
                 print( f"Step: {self.step}/{self.train_num_steps} [{self.step/self.train_num_steps*100:.1f}%] loss: {total_loss:.5f}" \
                                         f" recon_loss: {recon_loss:.5f}" \
                                             f" z_loss: {z_loss:.5f} " \
+                                            f"lr: {scheduler.get_last_lr()[0]}" \
                                             f" ET: { (time.time() - time_start) / (self.step+1) * (self.train_num_steps - self.step) / 3600} hours")
 
             accelerator.wait_for_everyone()
             accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
             self.opt.step()
+            scheduler.step()
             self.opt.zero_grad()
 
             accelerator.wait_for_everyone()
@@ -1053,6 +1097,15 @@ class Trainer1D(object):
                         print(f'saving to {fout}')
                         utils.save_image(all_samples_cond,fout , nrow = seq_length)
 
+
+                        if self.cond_combined:
+                            all_samples_cond = self.ema.ema_model.sample(batch_size=n , set_y_to_0 = True)
+                            all_samples_cond = rearrange(all_samples_cond, 'b n c h w -> (b n) c h w')
+                            fout = str(self.results_folder / f'sample-cond-yto0-{milestone}.png')
+                            print(f'saving to {fout}')
+                            utils.save_image(all_samples_cond,fout , nrow = seq_length)                                         
+
+                          
 
                     
 

@@ -21,15 +21,17 @@ def generate_exp_id():
 
 
 import argparse
-parser = argparse.ArgumentParser()
-parser.add_argument('--exp_id', type=str, default=generate_exp_id())
-parser.add_argument('--pretrained', action='store_true')
-parser.add_argument('--lr', type=float, default=1e-4)
-parser.add_argument('--recon_weight', type=float, default=.0)
-parser.add_argument('--z_weight', type=float, default=1e-5)
-parser.add_argument('--z_diff', type=float, default=1e-5)
-parser.add_argument('--cond', action='store_true')
-parser.add_argument('--size', type=int, default=32)
+parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('--exp_id', type=str, default=generate_exp_id(),help='X')
+parser.add_argument('--pretrained', action='store_true',help='X')
+parser.add_argument('--lr', type=float, default=1e-4,help='X')
+parser.add_argument('--recon_weight', type=float, default=.0,help='X')
+parser.add_argument('--z_weight', type=float, default=1e-5, help='X')
+parser.add_argument('--z_diff', type=float, default=1e-5, help='X')
+parser.add_argument('--cond', action='store_true', help='X')
+parser.add_argument('--size', type=int, default=32, help='X')
+parser.add_argument('--mod_lr', action='store_true', help='X')
+parser.add_argument('--cond_combined', action='store_true',help='X')
 
 
 args = parser.parse_args()
@@ -172,7 +174,9 @@ trainer = Trainer1D(
     results_folder= f"./results/{args.exp_id}/",
     recon_weight=args.recon_weight,
     z_weight=args.z_weight,
-    y_cond = args.cond
+    y_cond = args.cond,
+    mod_lr = args.mod_lr,
+    cond_combined = args.cond_combined
 )
 trainer.train()
 
