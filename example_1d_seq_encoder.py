@@ -2,10 +2,8 @@ import torch
 #from denoising_diffusion_pytorch import Unet1D, GaussianDiffusion1D, Trainer1D, Dataset1D
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d_encoder import GaussianDiffusion1D, Unet1D, Trainer1D, Dataset1D
 
-import sys
-sys.path.append('../Conv-VAE-PyTorch')
+from vision_model.model import VanillaVAE
 
-from model.model import VanillaVAE
 from torch import nn
 
 import random
