@@ -26,6 +26,36 @@ from torchvision import utils
 from torch.optim.lr_scheduler import LambdaLR
 
 
+class VAEEncoder(nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        self.vae = vae
+        self.sample_noise = False
+
+    def __call__(self, x):
+        mu, logvar, z = self.vae.encode(x)
+        if self.sample_noise:
+            return z
+        else:
+            return mu
+
+    def encode(self, x):
+        return self.__call__(x)
+
+
+class VAEDecoder(nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        self.vae = vae
+
+    def __call__(self, z):
+        return self.vae.decode(z)
+
+    def decode(self, z):
+        return self.__call__(z)
+
+
+
 # constants
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
@@ -435,22 +465,26 @@ class GaussianDiffusion1D(Module):
         model,
         *,
         seq_length,
+        name = "GaussianDiffusion1D_v0",
+        class_name = "GaussianDiffusion1D",
         timesteps = 1000,
         sampling_timesteps = None,
         objective = 'pred_noise',
         beta_schedule = 'cosine',
         ddim_sampling_eta = 0.,
         auto_normalize = True,
-        encoder = None,
-        decoder = None,
+        vision_model = None,
         loss_image_space = True,
         z_diff = 1.,
         image_weight = 1.,
     ):
         super().__init__()
+        self.name = name
+        self.class_name = class_name
 
-        self.encoder = encoder
-        self.decoder = decoder
+        self.vision_model = vision_model
+        self.encoder = VAEEncoder(vision_model)
+        self.decoder = VAEDecoder(vision_model)
         self.loss_image_space = loss_image_space
         self.image_weight = image_weight
         self.z_diff = z_diff
@@ -750,7 +784,7 @@ class GaussianDiffusion1D(Module):
         loss = reduce(loss, 'b ... -> b', 'mean')
 
         loss = loss * extract(self.loss_weight, t, loss.shape)
-        out =  self.z_diff * loss.mean()
+        out =   loss.mean()
 
         if self.loss_image_space:
             if self.objective == 'pred_v':
@@ -767,19 +801,19 @@ class GaussianDiffusion1D(Module):
             img_start = self.decoder(_x_start)
 
             
-            loss = F.mse_loss(img_start, seq_img, reduction = 'none')
+            out2 = F.mse_loss(img_start, seq_img, reduction = 'none')
             # back to seq
-            loss = rearrange(loss, '(b n) c h w -> b n c h w', b = b)
-            loss = reduce(loss, 'b ... -> b', 'mean')
-            loss = loss * extract(self.loss_weight, t, loss.shape)
+            out2 = rearrange(out2, '(b n) c h w -> b n c h w', b = b)
+            out2 = reduce(out2, 'b ... -> b', 'mean')
+            out2 = out2 * extract(self.loss_weight, t, out2.shape)
             #print('loss before' , out)
-            out += self.image_weight * loss.mean()
+            out2 = out2.mean()
             #print('loss after')
             #print(out)
 
 
 
-        return out
+        return { 'z_loss': out, 'img_loss': out2}
 
     def forward(self, img, y = None, set_y_to_0 = False,  *args, **kwargs):
 
@@ -810,6 +844,10 @@ class GaussianDiffusion1D(Module):
 
         _z = self.normalize(_z)
         return self.p_losses(_z, t, *args, **kwargs, y = y,  seq_img = _img)
+
+    def loss(self, x, y):
+        return self.forward( img=x, y = y)
+
 
 # trainer class
 
