@@ -714,6 +714,7 @@ class GaussianDiffusion1D(Module):
 
         if y  is not None:
             y = self.encoder(y)
+            batch_size = y.shape[0]
         if set_y_to_0:
             y = torch.zeros(batch_size, seq_length).to(self.model.device)
 
@@ -847,6 +848,9 @@ class GaussianDiffusion1D(Module):
 
     def loss(self, x, y):
         return self.forward( img=x, y = y)
+    
+    # def sample(self, y):
+    #     return self.sample(y=y)
 
 
 # trainer class
