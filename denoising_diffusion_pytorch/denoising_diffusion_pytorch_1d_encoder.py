@@ -484,8 +484,6 @@ class GaussianDiffusion1D(Module):
         auto_normalize = True,
         vision_model = None,
         loss_image_space = True,
-        z_diff = 1.,
-        image_weight = 1.,
     ):
         super().__init__()
         self.name = name
@@ -495,8 +493,6 @@ class GaussianDiffusion1D(Module):
         self.encoder = VAEEncoder(vision_model)
         self.decoder = VAEDecoder(vision_model)
         self.loss_image_space = loss_image_space
-        self.image_weight = image_weight
-        self.z_diff = z_diff
 
         self.model = model
         self.channels = self.model.channels
@@ -892,8 +888,9 @@ class Trainer1D(object):
         y_cond = False, 
         mod_lr = True,
         cond_combined = False, # for z=0, this should be an unconditional model
-        weight_decay = 0.0
-
+        weight_decay = 0.0,
+        z_diff_weight = 1e-4,
+        img_diff_weight = 1.,
 ):
         super().__init__()
 
@@ -906,6 +903,8 @@ class Trainer1D(object):
         self.cond_combined = cond_combined
 
         self.y_cond = y_cond
+        self.z_diff_weight = z_diff_weight
+        self.img_diff_weight = img_diff_weight
 
         self.accelerator = Accelerator(
             split_batches = split_batches,
@@ -1055,12 +1054,15 @@ class Trainer1D(object):
                         if self.cond_combined:
                             # randomnly set the condition to zero
                             if random() < 0.5:
-                                loss = self.model(data, y = data[:,0,:,:,:])
+                                loss_dict = self.model(data, y = data[:,0,:,:,:])
+
                             else:
-                                loss = self.model(data,set_y_to_0 = True)
+
+                                loss_dict = self.model(data,set_y_to_0 = True)
                         else:
-                            loss = self.model(data, y = data[:,0,:,:,:])
+                            loss_dict = self.model(data, y = data[:,0,:,:,:])
                         
+                    loss = self.z_diff_weight * loss_dict['z_loss'] + self.img_diff_weight * loss_dict['img_loss']
                     loss = loss / self.gradient_accumulate_every
                     total_loss += loss.item()
 

@@ -87,6 +87,7 @@ import torch.nn.functional as F
 # Slice the tensor to take one every two elements
 my_data_reduced = my_data[:, ::2, :, :, :]
 
+my_data_reduced = my_data_reduced.clamp(.1, .9)
 
 if args.size == 32:
 
@@ -125,28 +126,28 @@ model = Unet1D(
     y_cond_as_x=args.y_cond_as_x
 )
 
-class VAEencoder(nn.Module):
-    def __init__(self, vae):
-        super().__init__()
-        self.vae = vae
-        self.sample_noise = False
-    def __call__(self,img):
-        mu, log_var, z = self.vae.encode(img)
-        if self.sample_noise:
-            return z
-        else:
-            return mu
-    
-class VAEdecoder(nn.Module):
-    def __init__(self, vae):
-        super().__init__()
-        self.vae = vae
-    def __call__(self,z):
-        return self.vae.decode(z)
-    
-encoder = VAEencoder(vision_model)
-decoder = VAEdecoder(vision_model)
-
+# class VAEencoder(nn.Module):
+#     def __init__(self, vae):
+#         super().__init__()
+#         self.vae = vae
+#         self.sample_noise = False
+#     def __call__(self,img):
+#         mu, log_var, z = self.vae.encode(img)
+#         if self.sample_noise:
+#             return z
+#         else:
+#             return mu
+#     
+# class VAEdecoder(nn.Module):
+#     def __init__(self, vae):
+#         super().__init__()
+#         self.vae = vae
+#     def __call__(self,z):
+#         return self.vae.decode(z)
+#     
+# encoder = VAEencoder(vision_model)
+# decoder = VAEdecoder(vision_model)
+#
 
 diffusion = GaussianDiffusion1D(
     model,
@@ -154,16 +155,20 @@ diffusion = GaussianDiffusion1D(
     timesteps = 100,
     objective = 'pred_v' ,
     auto_normalize = False,
-    encoder =  encoder   ,
-    decoder = decoder,
-    z_diff=args.z_diff
+    vision_model = vision_model,
     )
 
 
-loss = diffusion(my_data_resized[:32], y = my_data_resized[:32, 0, ...])
+loss_dict = diffusion(my_data_resized[:32], y = my_data_resized[:32, 0, ...])
+
+loss = loss_dict[ 'z_loss' ] + loss_dict[ 'img_loss' ]
 loss.backward()
 
 # Or using trainer
+
+
+print('max is ', my_data_resized.max())
+print('min is ', my_data_resized.min())
 
 dataset = Dataset1D(my_data_resized)  # this is just an example, but you can formulate your own Dataset and pass it into the `Trainer1D` below
 print(f'len dataset {len(dataset)}')
