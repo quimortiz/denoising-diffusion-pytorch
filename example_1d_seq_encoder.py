@@ -30,9 +30,16 @@ parser.add_argument('--cond', action='store_true', help='X')
 parser.add_argument('--size', type=int, default=32, help='X')
 parser.add_argument('--mod_lr', action='store_true', help='X')
 parser.add_argument('--cond_combined', action='store_true',help='X')
+parser.add_argument('--y_cond_as_x', action='store_true',help='X')
+parser.add_argument('--weight_decay', type=float, default=0.0, help='X')
 
 
 args = parser.parse_args()
+
+
+# args.cond = True
+# args.y_cond_as_x = True
+
 print(args)
 
 #args.size = 64
@@ -114,7 +121,8 @@ model = Unet1D(
     dim = 32,
     dim_mults = (1, 2, 4),
     channels = 8, 
-    y_cond = args.cond
+    y_cond = args.cond,
+    y_cond_as_x=args.y_cond_as_x
 )
 
 class VAEencoder(nn.Module):
@@ -152,12 +160,14 @@ diffusion = GaussianDiffusion1D(
     )
 
 
-loss = diffusion(my_data_resized[:32])
+loss = diffusion(my_data_resized[:32], y = my_data_resized[:32, 0, ...])
 loss.backward()
 
 # Or using trainer
 
 dataset = Dataset1D(my_data_resized)  # this is just an example, but you can formulate your own Dataset and pass it into the `Trainer1D` below
+print(f'len dataset {len(dataset)}')
+print(len(dataset))
 
 trainer = Trainer1D(
     diffusion,
@@ -174,7 +184,8 @@ trainer = Trainer1D(
     z_weight=args.z_weight,
     y_cond = args.cond,
     mod_lr = args.mod_lr,
-    cond_combined = args.cond_combined
+    cond_combined = args.cond_combined,
+    weight_decay=args.weight_decay
 )
 trainer.train()
 

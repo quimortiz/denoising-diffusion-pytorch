@@ -24,6 +24,7 @@ from tqdm.auto import tqdm
 from denoising_diffusion_pytorch.version import __version__
 from torchvision import utils
 from torch.optim.lr_scheduler import LambdaLR
+import einops
 
 
 # constants
@@ -276,15 +277,17 @@ class Unet1D(Module):
         sinusoidal_pos_emb_theta = 10000,
         attn_dim_head = 32,
         attn_heads = 4,
-        y_cond = None
+        y_cond = None, 
+        y_cond_as_x = False
     ):
         super().__init__()
 
         # determine dimensions
 
+        self.y_cond_as_x = y_cond_as_x
         self.channels = channels
         self.self_condition = self_condition
-        input_channels = channels * (2 if self_condition else 1)
+        input_channels = channels * (2 if self_condition or y_cond_as_x else 1)
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv1d(input_channels, init_dim, 7, padding = 3)
@@ -363,10 +366,14 @@ class Unet1D(Module):
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
 
+        if self.y_cond_as_x:
+            assert y is not None, 'y must be passed in if y_cond_as_x is True'
+            x = torch.cat(( x, einops.repeat(y, 'b c -> b c n', n = x.shape[2])), dim = 1)
+
         x = self.init_conv(x)
         r = x.clone()
 
-        if y is not None:
+        if y is not None and not self.y_cond_as_x:
             t = self.time_mlp(time) + self.y_mlp(y)
         else:
             t = self.time_mlp(time)
@@ -403,6 +410,8 @@ class Unet1D(Module):
 
         x = self.final_res_block(x, t)
         return self.final_conv(x)
+
+
 
 # gaussian diffusion trainer class
 
@@ -841,12 +850,14 @@ class Trainer1D(object):
         y_cond = False, 
         mod_lr = True,
         cond_combined = False, # for z=0, this should be an unconditional model
+        weight_decay = 0.0
 
 ):
         super().__init__()
 
         # accelerator
 
+        self.weight_decay = weight_decay
         self.recon_weight = recon_weight
         self.z_weight = z_weight
         self.mod_lr = mod_lr
@@ -885,7 +896,7 @@ class Trainer1D(object):
 
         # optimizer
 
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas, weight_decay=self.weight_decay)
 
         # for logging results in a folder periodically
 
@@ -1032,7 +1043,9 @@ class Trainer1D(object):
                                         f" recon_loss: {recon_loss:.5f}" \
                                             f" z_loss: {z_loss:.5f} " \
                                             f"lr: {scheduler.get_last_lr()[0]}" \
-                                            f" ET: { (time.time() - time_start) / (self.step+1) * (self.train_num_steps - self.step) / 3600} hours")
+                                            f" ET: { (time.time() - time_start) / (self.step+1) * (self.train_num_steps - self.step) / 3600} [hours]"
+                                            f" Time/step: { (time.time() - time_start) / (self.step+1)} [seconds]"
+                                            )
 
             accelerator.wait_for_everyone()
             accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
