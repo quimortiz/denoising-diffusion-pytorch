@@ -32,8 +32,7 @@ torch.set_num_threads(4)
 import sys
 sys.path.append('../Conv-VAE-PyTorch')
 
-from model.model import VanillaVAE
-
+from vision_model import VanillaVAE
 pretrained = True
 
 vision_model = VanillaVAE(in_channels=3, latent_dims=8)

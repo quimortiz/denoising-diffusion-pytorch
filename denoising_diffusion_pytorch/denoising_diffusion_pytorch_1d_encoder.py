@@ -27,6 +27,22 @@ from torch.optim.lr_scheduler import LambdaLR
 import einops
 
 
+def check_gradients(parameters, max_grad_norm=None):
+    for param in parameters:
+        if param.grad is not None:
+            # Check for NaNs or Infs in gradients
+            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                return False
+            
+            # Check if gradients exceed a maximum norm
+            if max_grad_norm is not None and torch.norm(param.grad) > max_grad_norm:
+                print( 'norm is ', torch.norm(param.grad))
+                return False
+    
+    return True
+
+
+
 class VAEEncoder(nn.Module):
     def __init__(self, vae):
         super().__init__()
@@ -115,7 +131,23 @@ class Dataset1D(Dataset):
         return len(self.tensor)
 
     def __getitem__(self, idx):
-        return self.tensor[idx].clone()
+        return { 'imgs': self.tensor[idx].clone() }
+
+class Dataset1D_img_and_u(Dataset):
+    def __init__(self, tensor: Tensor, u : Tensor):
+        super().__init__()
+        #self.tensor = tensor.clone()
+        self.tensor = tensor
+        self.us = u
+        assert len(tensor) == len(u)
+
+    def __len__(self):
+        return len(self.tensor)
+
+    def __getitem__(self, idx):
+        return { 'imgs': self.tensor[idx].clone(), 'us': self.us[idx].clone() }
+
+
 
 # small helper modules
 
@@ -297,7 +329,9 @@ class Unet1D(Module):
         init_dim = None,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
-        channels = 3,
+        # channels = 3,
+        nz = 8, 
+        nu = 0, 
         dropout = 0.,
         self_condition = False,
         learned_variance = False,
@@ -315,9 +349,12 @@ class Unet1D(Module):
         # determine dimensions
 
         self.y_cond_as_x = y_cond_as_x
+        channels = nz + nu
+        self.nz = nz
+        self.nu = nu
         self.channels = channels
         self.self_condition = self_condition
-        input_channels = channels * (2 if self_condition or y_cond_as_x else 1)
+        input_channels = self.nz * (2 if self_condition or y_cond_as_x else 1) + self.nu
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv1d(input_channels, init_dim, 7, padding = 3)
@@ -348,7 +385,7 @@ class Unet1D(Module):
         if y_cond is not None: 
 
             self.y_mlp = nn.Sequential(
-                nn.Linear(channels, time_dim),
+                nn.Linear(nz, time_dim),
                 nn.GELU(),
                 nn.Linear(time_dim, time_dim))
 
@@ -671,7 +708,7 @@ class GaussianDiffusion1D(Module):
         # b n c h w
         img = rearrange(img, 'b c n -> b n c')
         img = rearrange(img, 'b n c -> (b n) c')
-        img = self.decoder(img)
+        img = self.decoder(img[:,:self.model.nz])
         img = rearrange(img, '(b n) c h w -> b n c h w', b = batch)
 
         return img
@@ -804,7 +841,8 @@ class GaussianDiffusion1D(Module):
             _x_start = rearrange(_x_start, 'b n c -> (b n) c')
 
 
-            img_start = self.decoder(_x_start)
+            nz = self.model.nz
+            img_start = self.decoder(_x_start[:, :nz])
 
             
             out2 = F.mse_loss(img_start, seq_img, reduction = 'none')
@@ -821,7 +859,7 @@ class GaussianDiffusion1D(Module):
 
         return { 'z_loss': out, 'img_loss': out2}
 
-    def forward(self, img, y = None, set_y_to_0 = False,  *args, **kwargs):
+    def forward(self, img, u = None, y = None, set_y_to_0 = False,  *args, **kwargs):
 
         # Input is:
         # Batch x seq length x channels x height x width
@@ -842,6 +880,11 @@ class GaussianDiffusion1D(Module):
         # now i want, 
         # batch x z x seq length
         _z = rearrange(_z, 'b n z -> b z n')
+
+        if u is not None:
+            u = rearrange(u, 'b n c -> b c n')
+            _z = torch.cat((_z, u), dim = 1)
+
 
         b, c, n, device, seq_length, = *_z.shape, _z.device, self.seq_length
         assert n == seq_length, f'seq length must be {seq_length}'
@@ -891,6 +934,7 @@ class Trainer1D(object):
         weight_decay = 0.0,
         z_diff_weight = 1e-4,
         img_diff_weight = 1.,
+        freeze_encoder = False
 ):
         super().__init__()
 
@@ -938,6 +982,8 @@ class Trainer1D(object):
         # optimizer
 
         self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas, weight_decay=self.weight_decay)
+        if freeze_encoder:
+            self.opt =  Adam(diffusion_model.model.parameters(), lr = train_lr, betas = adam_betas, weight_decay=self.weight_decay)
 
         # for logging results in a folder periodically
 
@@ -1004,9 +1050,9 @@ class Trainer1D(object):
 
         # Define the learning rate lambda function
         def lr_lambda(step):
-            if step < 10000:
+            if step < 5 * 10000:
                 return 1 + (step / 10000) * 9  # linear increase from 1 to 10
-            elif step < 100000:
+            elif step < 5 * 100000:
                 return 10 - ((step - 10000) / 90000) * 9  # linear decrease from 10 to 1
             else:
                 return 1
@@ -1031,10 +1077,19 @@ class Trainer1D(object):
         while self.step < self.train_num_steps:
             self.model.train()
 
+            self.opt.zero_grad()
             total_loss = 0.
 
             for _ in range(self.gradient_accumulate_every):
-                data = next(self.dl).to(device)
+                # data = next(self.dl).to(device)
+                ddl = next(self.dl)
+
+                data =ddl['imgs'].to(device) 
+                if 'us' in ddl:
+                    us = ddl['us'].to(device) 
+                else:
+                    us = None
+
 
 
                 # _data = rearrange(data, 'b n c h w -> (b n) c h w')
@@ -1049,20 +1104,25 @@ class Trainer1D(object):
                 with self.accelerator.autocast():
 
                     if not self.y_cond : 
-                        loss = self.model(data)
+                        loss = self.model(data, u = us)
                     else: 
                         if self.cond_combined:
                             # randomnly set the condition to zero
                             if random() < 0.5:
-                                loss_dict = self.model(data, y = data[:,0,:,:,:])
+                                loss_dict = self.model(data, u = us, y = data[:,0,:,:,:])
 
                             else:
 
-                                loss_dict = self.model(data,set_y_to_0 = True)
+                                loss_dict = self.model(data,u = us, set_y_to_0 = True)
                         else:
-                            loss_dict = self.model(data, y = data[:,0,:,:,:])
+                            loss_dict = self.model(data, u = us , y = data[:,0,:,:,:])
                         
-                    loss = self.z_diff_weight * loss_dict['z_loss'] + self.img_diff_weight * loss_dict['img_loss']
+
+                    loss_z_diff = self.z_diff_weight *  loss_dict['z_loss']
+                    loss_img_diff = self.img_diff_weight * loss_dict['img_loss']
+
+                    loss = loss_z_diff + loss_img_diff
+
                     loss = loss / self.gradient_accumulate_every
                     total_loss += loss.item()
 
@@ -1082,25 +1142,69 @@ class Trainer1D(object):
                 self.accelerator.backward(loss)
 
             
+
             if self.step % 1000 == 0:
-                print( f"Step: {self.step}/{self.train_num_steps} [{self.step/self.train_num_steps*100:.1f}%] loss: {total_loss:.5f}" \
-                                        f" recon_loss: {recon_loss:.5f}" \
-                                            f" z_loss: {z_loss:.5f} " \
-                                            f"lr: {scheduler.get_last_lr()[0]}" \
-                                            f" ET: { (time.time() - time_start) / (self.step+1) * (self.train_num_steps - self.step) / 3600} [hours]"
-                                            f" Time/step: { (time.time() - time_start) / (self.step+1)} [seconds]"
-                                            )
+                print( f"Step: {self.step}/{self.train_num_steps} [{self.step/self.train_num_steps*100:.1f}%] " \
+                       f"loss: {total_loss:.5e} " \
+                       f"loss_z_diff: {loss_z_diff:.5e} " \
+                       f"loss_img_diff: {loss_img_diff:.5e} " \
+                       f"recon_loss: {recon_loss:.5e} " \
+                       f"z_loss: {z_loss:.5e} " \
+                       f"lr: {scheduler.get_last_lr()[0]:.5e} " \
+                       f"ET: { (time.time() - time_start) / (self.step+1) * (self.train_num_steps - self.step) / 3600:.5e} [hours] " \
+                       f"Time/step: { (time.time() - time_start) / (self.step+1):.5e} [seconds]"
+                )
 
             accelerator.wait_for_everyone()
-            accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
+            # Compute the norm of the gradients before clipping
+            total_norm = 0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            # print(f'Gradient norm before clipping: {total_norm}')
+
+            if total_norm > 20000 or math.isnan(total_norm) or math.isinf(total_norm):
+                self.opt.zero_grad()
+                print(f'Gradient norm before clipping: {total_norm}')
+                print('skipping! -- total norm is too large or nan or inf')
+                continue
+
+            # else:
+            #     print("taking step")
+
+            accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             self.opt.step()
             scheduler.step()
             self.opt.zero_grad()
-
             accelerator.wait_for_everyone()
-
             self.step += 1
+            # print(self.step)
+
+
+
+            # Check gradients and take an optimizer step only if gradients are valid
+            # if check_gradients(self.model.parameters(), 10000. * self.max_grad_norm):
+            #     # print('good step')
+            #     accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            #     self.opt.step()
+            #     scheduler.step()
+            #     self.opt.zero_grad()
+            #     accelerator.wait_for_everyone()
+            #     self.step += 1
+            #
+            # else:
+            #     print("Skipping optimizer step due to invalid gradients (NaN, Inf, or too large).")
+            #     self.opt.zero_grad()
+            #     accelerator.wait_for_everyone()
+            #     self.step += 1
+            #     continue
+
+
+
+
             if accelerator.is_main_process:
                 self.ema.update()
 

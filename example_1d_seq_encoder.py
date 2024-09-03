@@ -70,34 +70,34 @@ n = 16
 
 rand_data = torch.rand(batch, n , c, h , w)
 
-folder_name = '/home/quim/code/denoising-diffusion-pytorch/image_based/plots_trajs/2024-07-11/trajs_2024-07-11--13-52-35_6NVJR7/'
-
-    # load with pickle
-print('loading data with pickle')
-# with open(folder_name + 'datapoints.pkl', 'rb') as f:
-#     datapoints = pickle.load(f)
-with open(folder_name + 'trajectories.pkl', 'rb') as f:
-    trajectories = pickle.load(f)
-    print('data has been loaded with pickle!')
-
-my_data = torch.stack( [ traj['imgs'] for traj in trajectories] )
-del trajectories
-import torch.nn.functional as F
-
-# Slice the tensor to take one every two elements
-my_data_reduced = my_data[:, ::2, :, :, :]
-
-my_data_reduced = my_data_reduced.clamp(.1, .9)
-
-if args.size == 32:
-
-    my_data_resized = torch.stack( [
-    F.interpolate(traj, size=(32, 32), mode='bilinear', align_corners=False) for traj in my_data_reduced
-    ])
-elif args.size == 64:
-    my_data_resized = my_data_reduced
-else:
-    raise ValueError('only 32 and 64 are supported')
+# folder_name = '/home/quim/code/denoising-diffusion-pytorch/image_based/plots_trajs/2024-07-11/trajs_2024-07-11--13-52-35_6NVJR7/'
+#
+#     # load with pickle
+# print('loading data with pickle')
+# # with open(folder_name + 'datapoints.pkl', 'rb') as f:
+# #     datapoints = pickle.load(f)
+# with open(folder_name + 'trajectories.pkl', 'rb') as f:
+#     trajectories = pickle.load(f)
+#     print('data has been loaded with pickle!')
+#
+# my_data = torch.stack( [ traj['imgs'] for traj in trajectories] )
+# del trajectories
+# import torch.nn.functional as F
+#
+# # Slice the tensor to take one every two elements
+# my_data_reduced = my_data[:, ::2, :, :, :]
+#
+# my_data_reduced = my_data_reduced.clamp(.1, .9)
+#
+# if args.size == 32:
+#
+#     my_data_resized = torch.stack( [
+#     F.interpolate(traj, size=(32, 32), mode='bilinear', align_corners=False) for traj in my_data_reduced
+#     ])
+# elif args.size == 64:
+#     my_data_resized = my_data_reduced
+# else:
+#     raise ValueError('only 32 and 64 are supported')
 
 
 
@@ -106,7 +106,16 @@ else:
 
 # del datapoints
 
+data_in = "new_data.pt"
 
+data = torch.load(data_in)
+
+data = data.clamp(.1, .9)
+data = data[:, ::2, ...] # take one every two elments
+
+
+
+my_data_resized = data
 
 
 
@@ -121,7 +130,9 @@ if args.pretrained:
 model = Unet1D(
     dim = 32,
     dim_mults = (1, 2, 4),
-    channels = 8, 
+    nz = 12,
+    nu = 0,
+    # channels = 8, 
     y_cond = args.cond,
     y_cond_as_x=args.y_cond_as_x
 )
@@ -190,7 +201,8 @@ trainer = Trainer1D(
     y_cond = args.cond,
     mod_lr = args.mod_lr,
     cond_combined = args.cond_combined,
-    weight_decay=args.weight_decay
+    weight_decay=args.weight_decay,
+    z_diff_weight = args.z_diff
 )
 trainer.train()
 
