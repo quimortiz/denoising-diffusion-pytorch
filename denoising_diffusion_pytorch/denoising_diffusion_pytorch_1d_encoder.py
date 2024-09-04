@@ -25,7 +25,8 @@ from denoising_diffusion_pytorch.version import __version__
 from torchvision import utils
 from torch.optim.lr_scheduler import LambdaLR
 import einops
-
+from torch.nn.utils import clip_grad_norm_
+import time
 
 def check_gradients(parameters, max_grad_norm=None):
     for param in parameters:
@@ -689,29 +690,37 @@ class GaussianDiffusion1D(Module):
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, shape , y = None):
+    def p_sample_loop(self, shape , y = None, image_out = True):
         batch, device = shape[0], self.betas.device
 
-        img = torch.randn(shape, device=device)
+        z = torch.randn(shape, device=device)
 
 
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond , y = y)
+            z, x_start = self.p_sample(z, t, self_cond , y = y)
 
-        img = self.unnormalize(img)
+        z = self.unnormalize(z)
         # use the decoder to map
         # b c n 
         # into
         # b n c h w
-        img = rearrange(img, 'b c n -> b n c')
-        img = rearrange(img, 'b n c -> (b n) c')
-        img = self.decoder(img[:,:self.model.nz])
-        img = rearrange(img, '(b n) c h w -> b n c h w', b = batch)
 
-        return img
+        if image_out:
+            z = rearrange(z, 'b c n -> b n c')
+            _z = rearrange(z, 'b n c -> (b n) c')
+            img = self.decoder(_z[:,:self.model.nz])
+            # img = self.decoder(img)
+            img = rearrange(img, '(b n) c h w -> b n c h w', b = batch)
+        else:
+            img = None
+
+        return {"img": img, "z": z}
+
+
+
 
     @torch.no_grad()
     def ddim_sample(self, shape, clip_denoised = True):
@@ -750,17 +759,18 @@ class GaussianDiffusion1D(Module):
         return img
 
     @torch.no_grad()
-    def sample(self, batch_size = 16 , y = None, set_y_to_0 = False):
+    def sample(self, batch_size = 16 , y = None, set_y_to_0 = False, image_out = True , image_in = True):
         seq_length, channels = self.seq_length, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
 
-        if y  is not None:
-            y = self.encoder(y)
+        if y is not None:
+            if image_in: 
+                y = self.encoder(y)
             batch_size = y.shape[0]
         if set_y_to_0:
             y = torch.zeros(batch_size, seq_length).to(self.model.device)
 
-        return sample_fn((batch_size, channels, seq_length), y=y )
+        return sample_fn((batch_size, channels, seq_length), y=y, image_out = image_out) 
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -843,6 +853,7 @@ class GaussianDiffusion1D(Module):
 
             nz = self.model.nz
             img_start = self.decoder(_x_start[:, :nz])
+            # img_start = self.decoder(_x_start)
 
             
             out2 = F.mse_loss(img_start, seq_img, reduction = 'none')
@@ -950,12 +961,13 @@ class Trainer1D(object):
         self.z_diff_weight = z_diff_weight
         self.img_diff_weight = img_diff_weight
 
-        self.accelerator = Accelerator(
-            split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
-        )
+        # self.accelerator = Accelerator(
+        #     split_batches = split_batches,
+        #     mixed_precision = mixed_precision_type if amp else 'no'
+        # )
 
         # model
+        self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.model = diffusion_model
         self.channels = diffusion_model.channels
@@ -987,9 +999,9 @@ class Trainer1D(object):
 
         # for logging results in a folder periodically
 
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
+        # if self.accelerator.is_main_process:
+        self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+        self.ema.to(self.device)
             
             
 
@@ -1001,51 +1013,53 @@ class Trainer1D(object):
         self.step = 0
 
         # prepare model, dataloader, optimizer with accelerator
-
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        # self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
     @property
     def device(self):
-        return self.accelerator.device
+        return self._device
 
     def save(self, milestone):
-        if not self.accelerator.is_local_main_process:
-            return
+        # if not self.accelerator.is_local_main_process:
+        #     return
 
         data = {
             'step': self.step,
-            'model': self.accelerator.get_state_dict(self.model),
+            'model': self.model.state_dict(),
+            # self.accelerator.get_state_dict(self.model),
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+            # 'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__
         }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
-        accelerator = self.accelerator
-        device = accelerator.device
+        # accelerator = self.accelerator
+        device = self.device
 
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
 
-        model = self.accelerator.unwrap_model(self.model)
-        model.load_state_dict(data['model'])
+        # model = self.accelerator.unwrap_model(self.model)
+        # model
+        self.model.load_state_dict(data['model'])
 
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
-        if self.accelerator.is_main_process:
-            self.ema.load_state_dict(data["ema"])
+        # if self.accelerator.is_main_process:
+        self.ema.load_state_dict(data["ema"])
 
         if 'version' in data:
             print(f"loading from version {data['version']}")
 
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
-            self.accelerator.scaler.load_state_dict(data['scaler'])
+        # if exists(self.accelerator.scaler) and exists(data['scaler']):
+        #     self.accelerator.scaler.load_state_dict(data['scaler'])
 
     def train(self):
-        accelerator = self.accelerator
-        device = accelerator.device
+        # accelerator = self.accelerator
+        device = self.device
+        # accelerator.device
 
 
         # Define the learning rate lambda function
@@ -1055,17 +1069,16 @@ class Trainer1D(object):
             elif step < 5 * 100000:
                 return 10 - ((step - 10000) / 90000) * 9  # linear decrease from 10 to 1
             else:
-                return 1
+                return 1.
             
         def lr_fixed(step):
             return 1
 
+        time_start = time.time()
 
         
 
         #with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-        import time
-        time_start = time.time()
 
         if self.mod_lr:
             scheduler = LambdaLR(self.opt, lr_lambda)
@@ -1075,22 +1088,25 @@ class Trainer1D(object):
 
       
         while self.step < self.train_num_steps:
-            self.model.train()
 
-            self.opt.zero_grad()
+            self.model.train()
             total_loss = 0.
+
+            loss_z_diff =  torch.tensor(0., device = device)
+            loss_img_diff = torch.tensor(0., device = device)
+
+            recon_loss = torch.tensor(0., device = device)
+            z_loss = torch.tensor(0., device = device)
 
             for _ in range(self.gradient_accumulate_every):
                 # data = next(self.dl).to(device)
                 ddl = next(self.dl)
 
-                data =ddl['imgs'].to(device) 
+                data = ddl['imgs'].to(device) 
                 if 'us' in ddl:
                     us = ddl['us'].to(device) 
                 else:
                     us = None
-
-
 
                 # _data = rearrange(data, 'b n c h w -> (b n) c h w')
                 # fout = str(self.results_folder / f'original-x.png')
@@ -1098,64 +1114,66 @@ class Trainer1D(object):
                 # utils.save_image(_data,fout , nrow = self.batch_size)
                 # sys.exit()
 
-                
+                # with self.accelerator.autocast():
+                if not self.y_cond : 
+                    loss_dict = self.model(data, u = us)
+                else: 
+                    if self.cond_combined:
+                        # randomnly set the condition to zero
+                        if random() < 0.5:
+                            loss_dict = self.model(data, u = us, y = data[:,0,:,:,:])
 
-
-                with self.accelerator.autocast():
-
-                    if not self.y_cond : 
-                        loss = self.model(data, u = us)
-                    else: 
-                        if self.cond_combined:
-                            # randomnly set the condition to zero
-                            if random() < 0.5:
-                                loss_dict = self.model(data, u = us, y = data[:,0,:,:,:])
-
-                            else:
-
-                                loss_dict = self.model(data,u = us, set_y_to_0 = True)
                         else:
-                            loss_dict = self.model(data, u = us , y = data[:,0,:,:,:])
-                        
 
-                    loss_z_diff = self.z_diff_weight *  loss_dict['z_loss']
-                    loss_img_diff = self.img_diff_weight * loss_dict['img_loss']
-
-                    loss = loss_z_diff + loss_img_diff
-
-                    loss = loss / self.gradient_accumulate_every
-                    total_loss += loss.item()
-
-                    # add recon loss
-                    _data = rearrange(data, 'b n c h w -> (b n) c h w')
-                    _z = self.model.encoder(_data)
-                    _data_fake = self.model.decoder(_z)
-                    if self.y_cond : 
-                        assert self.recon_weight < 1e-12 , 'recon weight should be zero'
-                        recon_loss = 0.
+                            loss_dict = self.model(data,u = us, set_y_to_0 = True)
                     else:
-                        recon_loss = self.recon_weight * F.mse_loss(_data_fake, _data,reduction="mean") / self.gradient_accumulate_every
-                    z_loss = self.z_weight * F.mse_loss(_z, torch.zeros_like(_z) , reduction="mean") / self.gradient_accumulate_every
-                    loss += recon_loss + z_loss
+                        loss_dict = self.model(data, u = us , y = data[:,0,:,:,:])
+                    
+
+                loss_z_diff += self.z_diff_weight *  loss_dict['z_loss']
+                loss_img_diff += self.img_diff_weight * loss_dict['img_loss']
+
+                # loss = loss_z_diff + loss_img_diff
+
+                # accumulated_loss += loss
+                # loss = loss / self.gradient_accumulate_every
+
+                # add recon loss
+                _data = rearrange(data, 'b n c h w -> (b n) c h w')
+                _z = self.model.encoder(_data)
+                z_loss += self.z_weight * F.mse_loss(_z, torch.zeros_like(_z) , reduction="mean") 
+                # if self.y_cond : 
+                #     assert self.recon_weight < 1e-12 , 'recon weight should be zero'
+                #     recon_loss  += 0.
+                if self.recon_weight > 1e-12:
+                    _data_fake = self.model.decoder(_z)
+                    recon_loss += self.recon_weight * F.mse_loss(_data_fake, _data,reduction="mean") 
 
 
-                self.accelerator.backward(loss)
+            loss_z_diff /= self.gradient_accumulate_every
+            loss_img_diff /= self.gradient_accumulate_every
+            recon_loss /= self.gradient_accumulate_every
+            z_loss /= self.gradient_accumulate_every
 
+            loss = loss_z_diff + loss_img_diff + recon_loss + z_loss
+
+            self.opt.zero_grad()
+            loss.backward()
             
 
             if self.step % 1000 == 0:
                 print( f"Step: {self.step}/{self.train_num_steps} [{self.step/self.train_num_steps*100:.1f}%] " \
-                       f"loss: {total_loss:.5e} " \
-                       f"loss_z_diff: {loss_z_diff:.5e} " \
-                       f"loss_img_diff: {loss_img_diff:.5e} " \
-                       f"recon_loss: {recon_loss:.5e} " \
-                       f"z_loss: {z_loss:.5e} " \
+                       f"loss: {loss.item():.5e} " \
+                       f"loss_z_diff: {loss_z_diff.item():.5e} " \
+                       f"loss_img_diff: {loss_img_diff.item():.5e} " \
+                       f"recon_loss: {recon_loss.item():.5e} " \
+                       f"z_loss: {z_loss.item():.5e} " \
                        f"lr: {scheduler.get_last_lr()[0]:.5e} " \
                        f"ET: { (time.time() - time_start) / (self.step+1) * (self.train_num_steps - self.step) / 3600:.5e} [hours] " \
                        f"Time/step: { (time.time() - time_start) / (self.step+1):.5e} [seconds]"
                 )
 
-            accelerator.wait_for_everyone()
+            # accelerator.wait_for_everyone()
 
             # Compute the norm of the gradients before clipping
             total_norm = 0
@@ -1166,8 +1184,9 @@ class Trainer1D(object):
             total_norm = total_norm ** 0.5
             # print(f'Gradient norm before clipping: {total_norm}')
 
-            if total_norm > 20000 or math.isnan(total_norm) or math.isinf(total_norm):
-                self.opt.zero_grad()
+            if total_norm > 1000. or math.isnan(total_norm) or math.isinf(total_norm):
+                # self.opt.zero_grad()
+                print("loss", loss)
                 print(f'Gradient norm before clipping: {total_norm}')
                 print('skipping! -- total norm is too large or nan or inf')
                 continue
@@ -1175,11 +1194,11 @@ class Trainer1D(object):
             # else:
             #     print("taking step")
 
-            accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            # accelerator.
+            clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             self.opt.step()
             scheduler.step()
-            self.opt.zero_grad()
-            accelerator.wait_for_everyone()
+            # accelerator.wait_for_everyone()
             self.step += 1
             # print(self.step)
 
@@ -1205,7 +1224,8 @@ class Trainer1D(object):
 
 
 
-            if accelerator.is_main_process:
+            # if accelerator.is_main_process:
+            if True:
                 self.ema.update()
 
                 if self.step != 0 and self.step % self.save_and_sample_every == 0:
@@ -1218,13 +1238,13 @@ class Trainer1D(object):
                         milestone = self.step // self.save_and_sample_every
                         batches = num_to_groups(self.num_samples, self.batch_size)
                         #all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n , y = None if not self.y_cond else data[:,0,:,:,:]), batches))
-                        all_samples = self.ema.ema_model.sample(batch_size=n , y = None if not self.y_cond else data[:n,0,:,:,:])
+                        all_samples = self.ema.ema_model.sample(batch_size=n , y = None if not self.y_cond else data[:n,0,:,:,:])["img"]
 
                         if self.y_cond:
                             # we take 4 first samples, and use that as conditioning.
                             _y = data[:4,0,:,:,:]
                             _y = _y.repeat_interleave(4, dim=0)
-                            all_samples_cond = self.ema.ema_model.sample(batch_size=n , y = _y)
+                            all_samples_cond = self.ema.ema_model.sample(batch_size=n , y = _y)["img"]
                             # we repeat them so that we have [s1,s1,s1,s1 , s2,s2,s2,s2, ...]
 
                         #all_samples_list = list(map(lambda n: self.model.sample(batch_size=n), batches))
@@ -1260,7 +1280,7 @@ class Trainer1D(object):
 
 
                         if self.cond_combined:
-                            all_samples_cond = self.ema.ema_model.sample(batch_size=n , set_y_to_0 = True)
+                            all_samples_cond = self.ema.ema_model.sample(batch_size=n , set_y_to_0 = True)["img"]
                             all_samples_cond = rearrange(all_samples_cond, 'b n c h w -> (b n) c h w')
                             fout = str(self.results_folder / f'sample-cond-yto0-{milestone}.png')
                             print(f'saving to {fout}')
@@ -1282,4 +1302,5 @@ class Trainer1D(object):
 
             #pbar.update(1)
 
-        accelerator.print('training complete')
+        print("training complete")
+        # accelerator.print('training complete')

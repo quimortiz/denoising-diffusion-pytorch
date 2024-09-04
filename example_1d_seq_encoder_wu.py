@@ -1,5 +1,6 @@
 # Let use u's also!
 
+import sys
 import torch
 #from denoising_diffusion_pytorch import Unet1D, GaussianDiffusion1D, Trainer1D, Dataset1D
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d_encoder import GaussianDiffusion1D, Unet1D, Trainer1D, Dataset1D, Dataset1D_img_and_u
@@ -57,43 +58,43 @@ print(args)
 
 
 
-
-
-
-
-import sys
-
-
-
 # json_file = "/home/quim/code/nlp_diffusion/image_based/plots_trajs/2024-08-30/all_r_v0.json"
-# data = load_data_v2(json_file)
-# torch.save(data, "./new_data.pt")
+# data_img, data_us = load_data_v2(json_file)
+# print(data_img.shape)
+# print(data_us.shape)
+# torch.save(data_img, "./new_data_wu_img_THURSDAY.pt")
+# torch.save(data_us, "./new_data_wu_us_THURSDAY.pt")
 # sys.exit()
 
 
-# data = new_data.p
+
+nz = 8
 
 
-data_in = "new_data.pt"
-data = torch.load(data_in)
+if not args.train_u:
+
+    data_in = "new_data.pt"
+    data = torch.load(data_in)
+
+    load_pt = True
+    # my_data_resized, my_data_us_reduced =  load_data( load_pt = load_pt, size=args.size)
+    # nu = my_data_us_reduced.shape[-1]
+
+    nu = 0
+    data_in = "new_data.pt"
+    data = torch.load(data_in)
+    data = data[:, ::2, ...] # take one every two elments
+
+else: 
+    nu = 2
+    data = torch.load("./new_data_wu_img_THURSDAY.pt")
+    data_us =  torch.load("./new_data_wu_us_THURSDAY.pt")
+    data = data[:, ::2, ...] # take one every two elments
+    data_us = data_us[:,::2,...]
+    my_data_us_reduced = data_us
 
 
-# i want to reduce the sequence length from 16 to 8
-
-
-# del datapoints
-
-load_pt = True
-# my_data_resized, my_data_us_reduced =  load_data( load_pt = load_pt, size=args.size)
-# nu = my_data_us_reduced.shape[-1]
-
-nz = 12
-nu = 0
-
-data_in = "new_data.pt"
-data = torch.load(data_in)
 data = data.clamp(.1, .9)
-data = data[:, ::2, ...] # take one every two elments
 my_data_resized = data
 
 if args.size == 32:
@@ -198,7 +199,7 @@ print(len(dataset))
 trainer = Trainer1D(
     diffusion,
     dataset = dataset,
-    train_batch_size = 64,
+    train_batch_size = 2*64,
     train_lr = args.lr,
     train_num_steps = args.train_num_steps,         # total training steps
     gradient_accumulate_every = 1,    # gradient accumulation steps
