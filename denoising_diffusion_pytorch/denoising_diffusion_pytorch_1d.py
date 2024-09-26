@@ -741,9 +741,11 @@ class Trainer1D(object):
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        max_grad_norm = 1.
+        max_grad_norm = 1.,
+        callback = None
     ):
         super().__init__()
+        self.callback = callback
 
         # accelerator
 
@@ -881,8 +883,14 @@ class Trainer1D(object):
 
                         all_samples = torch.cat(all_samples_list, dim = 0)
 
+                        if self.callback is not None:
+                            self.callback(all_samples, milestone)
+
                         torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
                         self.save(milestone)
+
+
+
 
                 pbar.update(1)
 

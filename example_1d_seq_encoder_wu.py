@@ -18,6 +18,12 @@ import torch
 import torch.nn.functional as F
 
 
+
+import sys # noqa
+sys.path.append('resnet-18-autoencoder/src') # noqa
+from classes.resnet_autoencoder import AE
+
+
 def generate_exp_id():
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
 
@@ -42,6 +48,8 @@ parser.add_argument('--y_cond_as_x', action='store_true',help='X')
 parser.add_argument('--weight_decay', type=float, default=0.0, help='X')
 parser.add_argument('--train_num_steps', type=int, default=100000, help='X')
 parser.add_argument('--train_u', action='store_true', help='X')
+parser.add_argument('--fix_encoder', action='store_true', help='X')
+parser.add_argument("--resnet", action="store_true", help="X")
 
 args = parser.parse_args()
 
@@ -58,40 +66,40 @@ print(args)
 
 
 
-# json_file = "/home/quim/code/nlp_diffusion/image_based/plots_trajs/2024-08-30/all_r_v0.json"
-# data_img, data_us = load_data_v2(json_file)
+# json_file = "/home/quim/code/nlp_diffusion/image_based/plots_trajs/2024-09-05/all_r_v1__2024-09-16--10-57-16.json"
+# all_data = load_data_v2(json_file)
 # print(data_img.shape)
 # print(data_us.shape)
-# torch.save(data_img, "./new_data_wu_img_THURSDAY.pt")
-# torch.save(data_us, "./new_data_wu_us_THURSDAY.pt")
+# torch.save(all_data, "./new_data_all_2024-09-05.pt")
+# torch.save(data_us, "./new_data_wu_us_2024-09-05.pt")
 # sys.exit()
 
 
 
 nz = 8
-
+n_elements = 4
 
 if not args.train_u:
-
-    data_in = "new_data.pt"
-    data = torch.load(data_in)
-
-    load_pt = True
-    # my_data_resized, my_data_us_reduced =  load_data( load_pt = load_pt, size=args.size)
-    # nu = my_data_us_reduced.shape[-1]
-
     nu = 0
-    data_in = "new_data.pt"
-    data = torch.load(data_in)
-    data = data[:, ::2, ...] # take one every two elments
-
-else: 
+else:
     nu = 2
-    data = torch.load("./new_data_wu_img_THURSDAY.pt")
-    data_us =  torch.load("./new_data_wu_us_THURSDAY.pt")
-    data = data[:, ::2, ...] # take one every two elments
-    data_us = data_us[:,::2,...]
-    my_data_us_reduced = data_us
+
+data_in = "./new_data_all_2024-09-05.pt"
+data = torch.load(data_in)['imgs']
+data_us = torch.load(data_in)['us']
+data = data[:, ::n_elements, ...] # take one every n_elements
+my_data_us_reduced = data_us[:,::n_elements,...]
+
+# else: 
+    # nu = 2
+    # data = torch.load("./new_data_wu_img_THURSDAY.pt")
+    # data_us =  torch.load("./new_data_wu_us_THURSDAY.pt")
+    # data = data[:, ::n_elements, ...] # take one every two elments
+    # data_us = data_us[:,::n_elements, ...]
+    # my_data_us_reduced = data_us
+
+
+
 
 
 data = data.clamp(.1, .9)
@@ -99,34 +107,44 @@ my_data_resized = data
 
 if args.size == 32:
     target_size = (32, 32)
-
-    # Reshape each image in the dataset to 32x32 using interpolate
-    # We need to reshape the tensor to combine Batch and Seq dimensions, resize, and then reshape back
     batch_size, seq_length, channels, height, width = my_data_resized.shape
-
-    # Reshape to (Batch * Seq, Channels, H, W) to apply the resize
     dataset_reshaped = my_data_resized.view(-1, channels, height, width)
-
-    # Apply interpolation (resize)
     dataset_resized = F.interpolate(dataset_reshaped, size=target_size, mode='bilinear', align_corners=False)
-
-    # Reshape back to (Batch, Seq, Channels, 32, 32)
     dataset_resized = dataset_resized.view(batch_size, seq_length, channels, *target_size)
     my_data_resized = dataset_resized
 
 # Now dataset_resized has shape (Batch, Seq, Channels, 32, 32)
     print(dataset_resized.shape)  # This should print torch.Size([10, 5, 3, 32, 32])
 
-vision_model = VanillaVAE(in_channels=3, latent_dims=nz , size = args.size)
+
+
+if args.resnet:
+    vision_model = AE('light') # try the default one!
+else:
+    vision_model = VanillaVAE(in_channels=3, latent_dims=nz, size=args.size)
+
+
+
+
 if args.pretrained:
-    path = '/home/quim/code/Conv-VAE-PyTorch/output/ZIN9X2/state_dict_ZIN9X2_e09900.pth'
-    vision_model.load_state_dict(torch.load(path))
+    if args.size == 32:
+        path = "results/i2n6ce/model-95000.pt"
+        vision_model.load_state_dict(torch.load(path)['model'])
+    if args.size == 64:
+        # path = "results/74idb0/model-95000.pt"
+        path = "results/6ghoqo/model-95000.pt"
+
+        if args.resnet:
+            path =  "results/5knvwh/model-95000.pt"
+        # vision_model = torch.load(path)['model_full']
+        print('loading model from ', path)
+        vision_model.load_state_dict(torch.load(path)['model'])
 
 
 
 model = Unet1D(
     dim = 32,
-    dim_mults = (1, 2, 4),
+    dim_mults = (1, 2),
     nz = nz, 
     nu = nu, 
     y_cond = args.cond,
@@ -158,7 +176,7 @@ model = Unet1D(
 
 diffusion = GaussianDiffusion1D(
     model,
-    seq_length = 8,
+    seq_length = int(16 / n_elements),
     timesteps = 100,
     objective = 'pred_v' ,
     auto_normalize = False,
@@ -195,38 +213,38 @@ print(f'len dataset {len(dataset)}')
 print(len(dataset))
 
 
-# lets load a 
-trainer = Trainer1D(
-    diffusion,
-    dataset = dataset,
-    train_batch_size = 2*64,
-    train_lr = args.lr,
-    train_num_steps = args.train_num_steps,         # total training steps
-    gradient_accumulate_every = 1,    # gradient accumulation steps
-    save_and_sample_every = 1000,
-    ema_decay = 0.995,                # exponential moving average decay
-    amp = True,                       # turn on mixed precision
-    results_folder= f"./results/{args.exp_id}/",
-    recon_weight=args.recon_weight,
-    z_weight=args.z_weight,
-    y_cond = args.cond,
-    mod_lr = args.mod_lr,
-    cond_combined = args.cond_combined,
-    weight_decay=args.weight_decay,
-    z_diff_weight = args.z_diff
-)
+if not args.fix_encoder:
+    trainer = Trainer1D(
+        diffusion,
+        dataset = dataset,
+        train_batch_size = 1*64,
+        train_lr = args.lr,
+        train_num_steps = args.train_num_steps,         # total training steps
+        gradient_accumulate_every = 1,    # gradient accumulation steps
+        save_and_sample_every = 1000,
+        ema_decay = 0.995,                # exponential moving average decay
+        amp = True,                       # turn on mixed precision
+        results_folder= f"./results/{args.exp_id}/",
+        recon_weight=args.recon_weight,
+        z_weight=args.z_weight,
+        y_cond = args.cond,
+        mod_lr = args.mod_lr,
+        cond_combined = args.cond_combined,
+        weight_decay=args.weight_decay,
+        z_diff_weight = args.z_diff
+    )
 
 
 
 
-# python    example_1d_seq_encoder_wu.py --cond --y_cond_as_x --lr 1e-3 --mod_lr
-# model = 'results/sjc0bq/model-86.pt'
-# _model = torch.load(model)
-# diffusion.load_state_dict(_model['model'])
-# this is working! TODO: lets evaluate the model a couple of time to see what happens!!
-# TODO: lets evaluate the distance between the z's
+    # python    example_1d_seq_encoder_wu.py --cond --y_cond_as_x --lr 1e-3 --mod_lr
+    # model = 'results/sjc0bq/model-86.pt'
+    # _model = torch.load(model)
+    # diffusion.load_state_dict(_model['model'])
+    # this is working! TODO: lets evaluate the model a couple of time to see what happens!!
+    # TODO: lets evaluate the distance between the z's
 
-trainer.train()
+    trainer.train()
 
 trainer = Trainer1D(
     diffusion,
@@ -250,6 +268,27 @@ trainer = Trainer1D(
 )
 
 trainer.train()
+
+# how to learn a good encoding space? 
+
+
+# TODO::
+# i minimze reconstruction loss and the distance between the z's inside one trajectory. 
+# e.g. pair wise distance between the z's.
+
+# from chatgpt
+# import torch
+#
+# # Example input: batch of trajectories with shape (B, n_seq, n_x)
+# trajectories = torch.randn(B, n_seq, n_x)
+#
+# # Compute the difference between consecutive time steps
+# diff = trajectories[:, 1:, :] - trajectories[:, :-1, :]
+#
+# # Compute the L2 squared norm along the last dimension (n_x)
+# l2_squared_norm = torch.sum(diff ** 2, dim=-1)
+#
+# # l2_squared_norm now has shape (B, n_seq-1)
 
 
 #second trainer with the 

@@ -343,12 +343,14 @@ class Unet1D(Module):
         attn_dim_head = 32,
         attn_heads = 4,
         y_cond = None, 
-        y_cond_as_x = False
+        y_cond_as_x = False,
+        predict_increment_in_z = False # todo: set to false!
     ):
         super().__init__()
 
         # determine dimensions
 
+        self.predict_increment_in_z = predict_increment_in_z
         self.y_cond_as_x = y_cond_as_x
         channels = nz + nu
         self.nz = nz
@@ -477,7 +479,12 @@ class Unet1D(Module):
         x = torch.cat((x, r), dim = 1)
 
         x = self.final_res_block(x, t)
-        return self.final_conv(x)
+
+        out = self.final_conv(x)
+        if self.predict_increment_in_z: 
+            seq_length = out.shape[2]
+            out[:, :y.shape[1] ,:] +=  y.unsqueeze(-1).repeat(1, 1, seq_length) 
+        return  out
 
 
 
@@ -522,9 +529,11 @@ class GaussianDiffusion1D(Module):
         auto_normalize = True,
         vision_model = None,
         loss_image_space = True,
+        fixed_encoder = False,
     ):
         super().__init__()
         self.name = name
+        self.fixed_encoder = fixed_encoder
         self.class_name = class_name
 
         self.vision_model = vision_model
@@ -539,6 +548,8 @@ class GaussianDiffusion1D(Module):
         self.seq_length = seq_length
 
         self.objective = objective
+
+        # self.predict_increment_in_z = True
 
         assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
 
@@ -711,8 +722,11 @@ class GaussianDiffusion1D(Module):
         if image_out:
             z = rearrange(z, 'b c n -> b n c')
             _z = rearrange(z, 'b n c -> (b n) c')
-            img = self.decoder(_z[:,:self.model.nz])
-            # img = self.decoder(img)
+            if self.fixed_encoder:
+                with torch.no_grad():
+                    img = self.decoder(_z[:,:self.model.nz])
+            else:
+                    img = self.decoder(_z[:,:self.model.nz])
             img = rearrange(img, '(b n) c h w -> b n c h w', b = batch)
         else:
             img = None
@@ -765,7 +779,11 @@ class GaussianDiffusion1D(Module):
 
         if y is not None:
             if image_in: 
-                y = self.encoder(y)
+                if self.fixed_encoder:
+                    with torch.no_grad():
+                        y = self.encoder(y)
+                else:
+                        y = self.encoder(y)
             batch_size = y.shape[0]
         if set_y_to_0:
             y = torch.zeros(batch_size, seq_length).to(self.model.device)
@@ -823,6 +841,7 @@ class GaussianDiffusion1D(Module):
 
         model_out = self.model(x, t, x_self_cond, y = y)
 
+
         if self.objective == 'pred_noise':
             target = noise
         elif self.objective == 'pred_x0':
@@ -837,7 +856,7 @@ class GaussianDiffusion1D(Module):
         loss = reduce(loss, 'b ... -> b', 'mean')
 
         loss = loss * extract(self.loss_weight, t, loss.shape)
-        out =   loss.mean()
+        out = loss.mean()
 
         if self.loss_image_space:
             if self.objective == 'pred_v':
@@ -852,7 +871,11 @@ class GaussianDiffusion1D(Module):
 
 
             nz = self.model.nz
-            img_start = self.decoder(_x_start[:, :nz])
+            if self.fixed_encoder:
+                with torch.no_grad():
+                    img_start = self.decoder(_x_start[:, :nz])
+            else:
+                img_start = self.decoder(_x_start[:, :nz])
             # img_start = self.decoder(_x_start)
 
             
@@ -879,11 +902,19 @@ class GaussianDiffusion1D(Module):
         batch_size = img.shape[0]
         seq_length = img.shape[1]
         _img = rearrange(img, 'b n c h w -> (b n) c h w')
-        _z = self.encoder(_img)
+        if self.fixed_encoder:
+            with torch.no_grad():
+                _z = self.encoder(_img)
+        else:
+            _z = self.encoder(_img)
         _z = rearrange(_z, '(b n) z -> b n z', b = img.shape[0])
 
         if y is not None:
-            y = self.encoder(y)
+            if self.fixed_encoder:
+                with torch.no_grad():
+                    y = self.encoder(y)
+            else:
+                y = self.encoder(y)
 
         if set_y_to_0:
                 y = torch.zeros(batch_size, seq_length).to(_z.device)
@@ -997,6 +1028,15 @@ class Trainer1D(object):
         if freeze_encoder:
             self.opt =  Adam(diffusion_model.model.parameters(), lr = train_lr, betas = adam_betas, weight_decay=self.weight_decay)
 
+            for param in diffusion_model.vision_model.parameters():
+                param.requires_grad = False
+
+            # for param in diffusion_model.encoder.parameters():
+            #     param.requires_grad = False
+            #
+            # for param in diffusion_model.decoder.parameters():
+            #     param.requires_grad = False
+
         # for logging results in a folder periodically
 
         # if self.accelerator.is_main_process:
@@ -1060,13 +1100,13 @@ class Trainer1D(object):
         # accelerator = self.accelerator
         device = self.device
         # accelerator.device
-
+        # self.train_num_steps:
 
         # Define the learning rate lambda function
         def lr_lambda(step):
-            if step < 5 * 10000:
+            if step <  .1 * self.train_num_steps:
                 return 1 + (step / 10000) * 9  # linear increase from 1 to 10
-            elif step < 5 * 100000:
+            elif step < .8 * self.train_num_steps:
                 return 10 - ((step - 10000) / 90000) * 9  # linear decrease from 10 to 1
             else:
                 return 1.
@@ -1265,7 +1305,11 @@ class Trainer1D(object):
 
                     # lets reconstruct the data
                     _z = self.model.encoder(_data)
-                    _data_fake = self.model.decoder(_z)
+                    if self.model.fixed_encoder:
+                        with torch.no_grad():
+                            _data_fake = self.model.decoder(_z)
+                    else:
+                        _data_fake = self.model.decoder(_z)
                     # print the average norm
                     print(f'average norm of z {_z.norm(dim=1).mean()}')
                     fout = str(self.results_folder / f'recon-{milestone}.png')

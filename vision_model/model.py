@@ -81,6 +81,65 @@ class Flow(nn.Module):
         return x, log_det
 
 
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+class ResnetVAE(BaseModel):
+    """
+
+    """
+    def __init__(self, output_dim=8, pretrained=True):
+        super(ResnetVAE, self).__init__()
+        # Load the ResNet18 model with pretrained weights
+        resnet = models.resnet18(pretrained=pretrained)
+        
+        # Remove the last fully connected layer (fc layer)
+        self.encoder = nn.Sequential(*list(resnet.children())[:-1])
+        
+        # Add a fully connected layer to reduce 512-dim output to the desired output_dim (e.g., 8)
+        self.fc = nn.Linear(512, output_dim)
+        
+    def encode(self, input: Tensor) -> List[Tensor]:
+        """
+        Encodes the input by passing through the convolutional network
+        and outputs the latent variables.
+
+        Params:
+            input (Tensor): Input tensor [N x C x H x W]
+
+        Returns:
+            mu (Tensor) and log_var (Tensor) of latent variables
+        """
+
+        result = self.encoder(input)
+        result = torch.flatten(result, start_dim=1)
+
+        # Split the result into mu and var components
+        # of the latent Gaussian distribution
+        mu = self.fc_mu(result)
+        log_var = self.fc_var(result)
+
+        if self.flow_check:
+            z, log_det = self.reparameterize(mu, log_var)
+            return mu, log_var, z, log_det
+
+        else:
+            z = self.reparameterize(mu, log_var)
+            return mu, log_var, z
+
+
+    def forward(self, x):
+        # Forward pass through the encoder
+        x = self.encoder(x)
+        x = torch.flatten(x, 1)  # Flatten the output tensor
+        
+        # Forward pass through the additional fully connected layer
+        x = self.fc(x)
+        return x
+
+
+
 class VanillaVAE(BaseModel):
 
     def __init__(self,
