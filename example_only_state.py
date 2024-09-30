@@ -1,11 +1,15 @@
 import torch
-from denoising_diffusion_pytorch import (
-    Unet1D,
-    GaussianDiffusion1D,
-    Trainer1D,
-    Dataset1D,
-    Dataset1DCond,
-)
+
+# from denoising_diffusion_pytorch import (
+#     Unet1D,
+#     GaussianDiffusion1D,
+#     Trainer1D,
+#     Dataset1D,
+#     Dataset1DCond,
+# )
+#
+from denoising_diffusion_pytorch import Unet, GaussianDiffusion, Trainer, MLPNet, GaussianDiffusionMLP, TrainerMLP
+
 
 import random
 import string
@@ -26,7 +30,11 @@ sys.path.append('resnet-18-autoencoder/src') # noqa
 from classes.resnet_autoencoder import AE
 import pathlib
 
-torch.set_num_threads(2)
+
+from torch.utils.data import TensorDataset
+
+
+torch.set_num_threads(1)
 
 
 
@@ -53,15 +61,24 @@ args = parser.parse_args()
 
 
 nz = 8
-n_elements = 2
+n_elements = 1
 seq_length = int ( 16 // n_elements)
 vision_model = VanillaVAE(in_channels=3, latent_dims=nz , size = args.size)
-model = Unet1D(dim=64, dim_mults=(1, 2, 4), nx=8, nu=0, ny=8)
+# model = Unet1D(dim=64, dim_mults=(1, 2, 4), nx=8, nu=0, ny=8)
 
-diffusion = GaussianDiffusion1D(
-    model, seq_length=seq_length, timesteps=100, objective="pred_v"
+model = MLPNet(
+    dim =  nz
 )
 
+diffusion = GaussianDiffusionMLP(
+    model,
+    vector_size = nz,
+    objective = "pred_v",
+    # image_size = 64,
+    beta_schedule = 'cosine',
+    timesteps = 100,    # number of steps
+    # auto_normalize= False
+)
 
 
 if not args.train_u:
@@ -126,7 +143,7 @@ vision_model = vision_model.to(device)
 
 print("encoding data...")
 with torch.no_grad():
-    for traj in my_data_resized:
+    for traj in my_data_resized[:100]:
         traj_latent = vision_model.encode(traj.to(device))[0]
         trajs_latent.append(traj_latent.cpu())
 
@@ -134,75 +151,52 @@ trajs_latent = torch.stack(trajs_latent)
 
 # rearrange to (B, channels, seq)
 
-trajs_latent = rearrange(trajs_latent, 'b seq c -> b c seq')
+states = rearrange(trajs_latent, 'b seq c -> (b seq) c').to(torch.device("cpu"))
+rand_idx = torch.randperm(states.size(0))
 
-
-
-dataset = Dataset1DCond( trajs_latent , trajs_latent[:,:nz, 0])
-
-rand_idx = torch.randperm(len(dataset))
-y_eval = trajs_latent[rand_idx[:16],:nz, 0]
-
-
-
-sampled_seq = diffusion.sample(batch_size=4, y = trajs_latent[:4,:nz, 0])
+dataset = TensorDataset(states)
 
 
 results_folder = pathlib.Path(f"results/{args.exp_id}")
 results_folder.mkdir(parents=True, exist_ok=True)
-
+diffusion.to(torch.device("cpu"))
 
 def callback(model, milestone):
     """
 
     """
-    samples_per_y =4
-    model.eval()
-    device = next(model.parameters()).device
-    with torch.no_grad():
-        ys  = y_eval[:6].repeat_interleave(samples_per_y, dim=0).to(device)
-        all_samples_cond = model.sample( batch_size=ys.shape[0], y = ys)
-        seq_length = all_samples_cond.shape[2]
-        imgs = vision_model.decode(
-            rearrange(all_samples_cond, 'b c seq -> (b seq) c')
-            )
+    # sample with the model
+    
+    yout = model.sample(batch_size=32)
+    # convert to images
+    vision_model_device = next(vision_model.parameters()).device
+    imgs = vision_model.decode(yout.to(vision_model_device))
 
-        fout = str(results_folder / f'sample-imgs-cond-{milestone:05d}.png')
-
-        print(f'saving to {fout}')
-        utils.save_image(imgs, fout , nrow = seq_length)                                         
-
-        all_samples = model.sample( batch_size=y_eval.shape[0], y = y_eval.to(device))
-        seq_length = all_samples.shape[2]
-        imgs = vision_model.decode(
-            rearrange(all_samples, 'b c seq -> (b seq) c')
-            )
-        fout = str(results_folder / f'sample-imgs-{milestone:05d}.png')
-        print(f'saving to {fout}')
-        utils.save_image(imgs, fout , nrow = seq_length)
-
-    # get images from latent codes
+    fout = str(results_folder / f'sample-imgs-{milestone:05d}.png')
+    nrow = 8
+    print(f'saving to {fout}')
+    utils.save_image(imgs, fout , nrow = nrow)                                         
 
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-trainer = Trainer1D(
+trainer = TrainerMLP(
     diffusion,
-    dataset=dataset,
-    save_and_sample_every=200,
-    train_batch_size=32,
-    train_lr=1e-4,
-    train_num_steps=int(1e6),  # total training steps
-    gradient_accumulate_every=1,  # gradient accumulation steps
-    ema_decay=0.995,  # exponential moving average decay
-    amp=False,  # turn on mixed precision
-    callback = callback,
-    results_folder = str(results_folder)
+    folder=None,
+    train_batch_size = 32,
+    train_lr = 5*1e-4,
+    train_num_steps = int(1e6),         # total training steps
+    save_and_sample_every = 5000,
+    ema_decay = 0.995,                # exponential moving average decay
+    amp = False,                       # turn on mixed precision
+    calculate_fid = False,              # whether to calculate fid during training
+    dataset = dataset,
+    # TensorDataset(data),
+    results_folder = str(results_folder),
+    callback=callback,
+    # autonormalize = False
+    # image_model=vision_model,
 )
+
+
 trainer.train()
-#
-# # after a lot of training
-#
-sampled_seq = diffusion.sample(batch_size=4)
-# sampled_seq.shape  # (4, 32, 128)
+

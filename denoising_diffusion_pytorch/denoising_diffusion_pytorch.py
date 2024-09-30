@@ -30,6 +30,7 @@ from denoising_diffusion_pytorch.attend import Attend
 
 from denoising_diffusion_pytorch.version import __version__
 import matplotlib.pyplot as plt
+from torch.nn.utils import clip_grad_norm_
 
 import sys
 sys.path.append( "/home/quim/code/resnet-18-autoencoder/src/")
@@ -1321,18 +1322,23 @@ class TrainerMLP:
         save_best_and_latest_only = False,
         dataset= None,
         image_model=None,
-        id = "000"
+        id = "000",
+        device = torch.device("cpu"),
+        callback=None
+
     ):
         super().__init__()
         self.image_model = image_model
         self.id = id
+        self.device = device
+        self.callback = callback
 
         # accelerator
 
-        self.accelerator = Accelerator(
-            split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
-        )
+        # self.accelerator = Accelerator(
+        #     split_batches = split_batches,
+        #     mixed_precision = mixed_precision_type if amp else 'no'
+        # )
 
         # model
 
@@ -1374,7 +1380,7 @@ class TrainerMLP:
 
         dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
-        dl = self.accelerator.prepare(dl)
+        # dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
         # optimizer
@@ -1383,9 +1389,9 @@ class TrainerMLP:
 
         # for logging results in a folder periodically
 
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
+        # if self.accelerator.is_main_process:
+        self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+        self.ema.to(self.device)
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
@@ -1396,177 +1402,125 @@ class TrainerMLP:
 
         # prepare model, dataloader, optimizer with accelerator
 
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        # self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
         # FID-score computation
 
-        self.calculate_fid = calculate_fid and self.accelerator.is_main_process
+        # self.calculate_fid = calculate_fid and self.accelerator.is_main_process
+        #
+        # if self.calculate_fid:
+        #     from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
+        #
+        #     if not is_ddim_sampling:
+        #         self.accelerator.print(
+        #             "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
+        #             "Consider using DDIM sampling to save time."
+        #         )
+        #
+        #     self.fid_scorer = FIDEvaluation(
+        #         batch_size=self.batch_size,
+        #         dl=self.dl,
+        #         sampler=self.ema.ema_model,
+        #         channels=self.channels,
+        #         accelerator=self.accelerator,
+        #         stats_dir=results_folder,
+        #         device=self.device,
+        #         num_fid_samples=num_fid_samples,
+        #         inception_block_idx=inception_block_idx
+        #     )
+        #
+        # if save_best_and_latest_only:
+        #     assert calculate_fid, "`calculate_fid` must be True to provide a means for model evaluation for `save_best_and_latest_only`."
+        #     self.best_fid = 1e10 # infinite
+        #
+        # self.save_best_and_latest_only = save_best_and_latest_only
 
-        if self.calculate_fid:
-            from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
-
-            if not is_ddim_sampling:
-                self.accelerator.print(
-                    "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
-                    "Consider using DDIM sampling to save time."
-                )
-
-            self.fid_scorer = FIDEvaluation(
-                batch_size=self.batch_size,
-                dl=self.dl,
-                sampler=self.ema.ema_model,
-                channels=self.channels,
-                accelerator=self.accelerator,
-                stats_dir=results_folder,
-                device=self.device,
-                num_fid_samples=num_fid_samples,
-                inception_block_idx=inception_block_idx
-            )
-
-        if save_best_and_latest_only:
-            assert calculate_fid, "`calculate_fid` must be True to provide a means for model evaluation for `save_best_and_latest_only`."
-            self.best_fid = 1e10 # infinite
-
-        self.save_best_and_latest_only = save_best_and_latest_only
-
-    @property
-    def device(self):
-        return self.accelerator.device
-
+    # @property
+    # def device(self):
+    #     return self.accelerator.device
+    #
     def save(self, milestone):
-        if not self.accelerator.is_local_main_process:
-            return
+        # if not self.accelerator.is_local_main_process:
+        #     return
 
         data = {
             'step': self.step,
-            'model': self.accelerator.get_state_dict(self.model),
+            'model': self.model.state_dict(),
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+            # 'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__
         }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
-        accelerator = self.accelerator
-        device = accelerator.device
+        # accelerator = self.accelerator
+        device = self.device
 
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
 
-        model = self.accelerator.unwrap_model(self.model)
+        model = self.model
+        # model = self.accelerator.unwrap_model(self.model)
         model.load_state_dict(data['model'])
 
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
-        if self.accelerator.is_main_process:
-            self.ema.load_state_dict(data["ema"])
+        # if self.accelerator.is_main_process:
+        self.ema.load_state_dict(data["ema"])
 
         if 'version' in data:
             print(f"loading from version {data['version']}")
 
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
-            self.accelerator.scaler.load_state_dict(data['scaler'])
+        # if exists(self.accelerator.scaler) and exists(data['scaler']):
+        #     self.accelerator.scaler.load_state_dict(data['scaler'])
 
     def train(self):
-        accelerator = self.accelerator
-        device = accelerator.device
-
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-
-            while self.step < self.train_num_steps:
-                self.model.train()
-
-                total_loss = 0.
-
-                for _ in range(self.gradient_accumulate_every):
-                    if self.dataset is not None:
-                        data = next(self.dl)[0].to(device)
-                    else:
-                        data = next(self.dl).to(device)
-
-                    with self.accelerator.autocast():
-                        loss = self.model(data)
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
-
-                    self.accelerator.backward(loss)
-
-                pbar.set_description(f'loss: {total_loss:.4f}')
-
-                accelerator.wait_for_everyone()
-                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
-                self.opt.step()
-                self.opt.zero_grad()
-
-                accelerator.wait_for_everyone()
-
-                self.step += 1
-                if accelerator.is_main_process:
-                    self.ema.update()
-
-                    if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
-                        self.ema.ema_model.eval()
-
-                        with torch.inference_mode():
-                            milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
-
-                        all_images = torch.cat(all_images_list, dim = 0)
-
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+        # accelerator = self.accelerator
+        device = self.device
 
 
+        while self.step < self.train_num_steps:
+            self.model.train()
 
-                        X = self.model.sample(batch_size = 128, return_all_timesteps = False)
+            total_loss = 0.
+
+            if self.dataset is not None:
+                data = next(self.dl)[0].to(device)
+            else:
+                data = next(self.dl).to(device)
+
+            # with self.accelerator.autocast():
+            loss = self.model(data)
+            loss = loss 
+            total_loss += loss.item()
+
+            self.opt.zero_grad()
+            loss.backward()
+                # .backward(loss)
 
 
-                        if self.image_model is not None:
-                            
-                            with torch.no_grad():
-                                IMG_x = self.image_model.decoder_low(X)
+            clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                                plot_ae_outputs(self.image_model, "t_dataset", 
-                                                self.step , IMG_x, device, n=10, id=self.id)
+            self.opt.step()
 
+            self.step += 1
+            # if accelerator.is_main_process:
+            self.ema.update()
 
-                        else:
-                            def plot_data(ax,X):
-                                XX = X[:,0]
-                                YY = X[:,1]
-                                ax.plot(XX,YY, 'o')
+            if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
+                print(f'step {self.step} / {self.train_num_steps}, loss: {total_loss}')
+                self.ema.ema_model.eval()
 
+                milestone = self.step // self.save_and_sample_every
 
-                            fig, ax = plt.subplots(1,1)
+                if self.callback is not None:
+                    self.callback(self.ema.ema_model, milestone)
+                self.save(milestone)
 
-                            plot_data(ax,X)
-                            ax.set_aspect('equal', 'box')
-                            ax.set_xlim(-1.5,1.5)
-                            ax.set_ylim(-1.5,1.5)
-                            # plt.show()
-                            fileout = str(self.results_folder / f'sample-{milestone}.png')
-                            print(f"saving to {fileout}")
-                            plt.savefig(fileout)
-                            plt.close()
+            # pbar.update(1)
 
-                        # whether to calculate fid
-
-                        if self.calculate_fid:
-                            fid_score = self.fid_scorer.fid_score()
-                            accelerator.print(f'fid_score: {fid_score}')
-                        if self.save_best_and_latest_only:
-                            if self.best_fid > fid_score:
-                                self.best_fid = fid_score
-                                self.save("best")
-                            self.save("latest")
-                        else:
-                            self.save(milestone)
-
-                pbar.update(1)
-
-        accelerator.print('training complete')
+        print('training complete')
 
 
 

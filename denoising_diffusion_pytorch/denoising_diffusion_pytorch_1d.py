@@ -889,77 +889,80 @@ class Trainer1D(object):
         # accelerator = self.accelerator
         device = self.device
 
-        with tqdm(initial = self.step, total = self.train_num_steps) as pbar:
+        # with tqdm(initial = self.step, total = self.train_num_steps) as pbar:
 
-            while self.step < self.train_num_steps:
-                self.model.train()
 
-                total_loss = 0.
+        while self.step < self.train_num_steps:
+            self.model.train()
 
-                for _ in range(self.gradient_accumulate_every):
-                    data_xu = next(self.dl)["xu"].to(device)
-                    data_y = next(self.dl)["y"].to(device)
-                    assert data_y.shape[0] == data_xu.shape[0], 'data_y and data_xu must have the same batch size'
+            total_loss = 0.
 
-                    # with self.accelerator.autocast():
-                    loss = self.model(data_xu, y=data_y)
-                    loss = loss / self.gradient_accumulate_every
-                    total_loss += loss.item()
+            # for _ in range(self.gradient_accumulate_every):
+            data_xu = next(self.dl)["xu"].to(device)
+            data_y = next(self.dl)["y"].to(device)
+            assert data_y.shape[0] == data_xu.shape[0], 'data_y and data_xu must have the same batch size'
 
-                    # self.accelerator.
-                    loss.backward()
-                    # backward(loss)
+            # with self.accelerator.autocast():
+            loss = self.model(data_xu, y=data_y)
+            loss = loss / self.gradient_accumulate_every
+            total_loss += loss.item()
 
-                pbar.set_description(f'loss: {total_loss:.4f}')
+            # self.accelerator.
+            loss.backward()
+                # backward(loss)
 
-                # accelerator.wait_for_everyone()
-                # accelerator.
-                clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            # pbar.set_description(f'loss: {total_loss:.4f}')
+            #
+            # accelerator.wait_for_everyone()
+            # accelerator.
+            clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                self.opt.step()
-                self.opt.zero_grad()
+            self.opt.step()
+            self.opt.zero_grad()
 
-                # accelerator.wait_for_everyone()
+            # accelerator.wait_for_everyone()
 
-                self.step += 1
-                # if accelerator.is_main_process:
-                self.ema.update()
+            self.step += 1
+            # if accelerator.is_main_process:
+            self.ema.update()
 
-                if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                    self.ema.ema_model.eval()
+            if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                print(f'step: {self.step} / {self.train_num_steps}, loss: {total_loss:.4f}')
+                self.ema.ema_model.eval()
 
-                    milestone = self.step // self.save_and_sample_every
-                    # with torch.no_grad():
-                    #     milestone = self.step // self.save_and_sample_every
-                        # batches = num_to_groups(self.num_samples, self.batch_size)
-                        # all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n,
-                        #                                                                 y = data_y[:n] if data_y is not None else None), batches))
-                        # all-
-                    #
-                    #     all_samples = self.ema.ema_model.sample(
-                    #         batch_size=self.num_samples,
-                    #         y = data_y[:self.num_samples] if data_y is not None else None)
-                    #
-                    #     # lets get the first 5 ys and repeat interleave 
-                    #     y = data_y[:5].repeat_interleave(4, dim = 0)
-                    #     all_samples_cond = self.ema.ema_model.sample(
-                    #         batch_size=y.shape[0],
-                    #         y = y)
-                    #
-                    #
-                    # # all_samples = torch.cat(all_samples_list, dim = 0)
-                    #
-                    # if self.callback is not None:
-                    #     self.callback(all_samples, milestone)
-                    #     self.callback()
+                milestone = self.step // self.save_and_sample_every
+                # with torch.no_grad():
+                #     milestone = self.step // self.save_and_sample_every
+                    # batches = num_to_groups(self.num_samples, self.batch_size)
+                    # all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n,
+                    #                                                                 y = data_y[:n] if data_y is not None else None), batches))
+                    # all-
+                #
+                #     all_samples = self.ema.ema_model.sample(
+                #         batch_size=self.num_samples,
+                #         y = data_y[:self.num_samples] if data_y is not None else None)
+                #
+                #     # lets get the first 5 ys and repeat interleave 
+                #     y = data_y[:5].repeat_interleave(4, dim = 0)
+                #     all_samples_cond = self.ema.ema_model.sample(
+                #         batch_size=y.shape[0],
+                #         y = y)
+                #
+                #
+                # # all_samples = torch.cat(all_samples_list, dim = 0)
+                #
+                # if self.callback is not None:
+                #     self.callback(all_samples, milestone)
+                #     self.callback()
 
-                    # torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                # torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                if self.callback is not None:
                     self.callback(self.ema.ema_model,milestone)
-                    self.save(milestone)
+                self.save(milestone)
 
 
 
 
-                pbar.update(1)
+            # pbar.update(1)
 
-        accelerator.print('training complete')
+        # accelerator.print('training complete')
