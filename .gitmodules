@@ -1,0 +1,3 @@
+[submodule "resnet-18-autoencoder"]
+	path = resnet-18-autoencoder
+	url = git@github.com:quimortiz/resnet-18-autoencoder.git
