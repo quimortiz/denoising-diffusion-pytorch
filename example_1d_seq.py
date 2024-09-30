@@ -4,6 +4,7 @@ from denoising_diffusion_pytorch import (
     GaussianDiffusion1D,
     Trainer1D,
     Dataset1D,
+    Dataset1DCond,
 )
 
 import random
@@ -23,6 +24,9 @@ from torchvision import utils
 import sys # noqa
 sys.path.append('resnet-18-autoencoder/src') # noqa
 from classes.resnet_autoencoder import AE
+import pathlib
+
+torch.set_num_threads(2)
 
 
 
@@ -52,7 +56,7 @@ nz = 8
 n_elements = 2
 seq_length = int ( 16 // n_elements)
 vision_model = VanillaVAE(in_channels=3, latent_dims=nz , size = args.size)
-model = Unet1D(dim=64, dim_mults=(1, 2, 4), channels=8)
+model = Unet1D(dim=64, dim_mults=(1, 2, 4), nx=8, nu=0, ny=8)
 
 diffusion = GaussianDiffusion1D(
     model, seq_length=seq_length, timesteps=100, objective="pred_v"
@@ -120,50 +124,73 @@ trajs_latent = []
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 vision_model = vision_model.to(device)
 
+print("encoding data...")
 with torch.no_grad():
     for traj in my_data_resized:
         traj_latent = vision_model.encode(traj.to(device))[0]
         trajs_latent.append(traj_latent.cpu())
 
 trajs_latent = torch.stack(trajs_latent)
-print("trajs latent are ready!!")
 
 # rearrange to (B, channels, seq)
 
 trajs_latent = rearrange(trajs_latent, 'b seq c -> b c seq')
 
 
-dataset = Dataset1D(
-    trajs_latent
-)  # this is just an example, but you can formulate your own Dataset and pass it into the `Trainer1D` below
+
+dataset = Dataset1DCond( trajs_latent , trajs_latent[:,:nz, 0])
+
+rand_idx = torch.randperm(len(dataset))
+y_eval = trajs_latent[rand_idx[:16],:nz, 0]
 
 
-sampled_seq = diffusion.sample(batch_size=4)
+
+sampled_seq = diffusion.sample(batch_size=4, y = trajs_latent[:4,:nz, 0])
 
 
-import pathlib
 results_folder = pathlib.Path(f"results/{args.exp_id}")
 results_folder.mkdir(parents=True, exist_ok=True)
 
 
-def callback(all_samples, milestone):
+def callback(model, milestone):
     """
 
     """
+    samples_per_y =4
+    model.eval()
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        ys  = y_eval[:6].repeat_interleave(samples_per_y, dim=0).to(device)
+        all_samples_cond = model.sample( batch_size=ys.shape[0], y = ys)
+        seq_length = all_samples_cond.shape[2]
+        imgs = vision_model.decode(
+            rearrange(all_samples_cond, 'b c seq -> (b seq) c')
+            )
+
+        fout = str(results_folder / f'sample-imgs-cond-{milestone:05d}.png')
+
+        print(f'saving to {fout}')
+        utils.save_image(imgs, fout , nrow = seq_length)                                         
+
+        all_samples = model.sample( batch_size=y_eval.shape[0], y = y_eval.to(device))
+        seq_length = all_samples.shape[2]
+        imgs = vision_model.decode(
+            rearrange(all_samples, 'b c seq -> (b seq) c')
+            )
+        fout = str(results_folder / f'sample-imgs-{milestone:05d}.png')
+        print(f'saving to {fout}')
+        utils.save_image(imgs, fout , nrow = seq_length)
+
     # get images from latent codes
-    seq_length = all_samples.shape[2]
-    imgs = vision_model.decode(
-        rearrange(all_samples, 'b c seq -> (b seq) c')
-        )
 
-    fout = str(results_folder / f'sample-imgs-{milestone}.png')
-    print(f'saving to {fout}')
-    utils.save_image(imgs, fout , nrow = seq_length)                                         
 
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 trainer = Trainer1D(
     diffusion,
     dataset=dataset,
+    save_and_sample_every=5000,
     train_batch_size=32,
     train_lr=1e-4,
     train_num_steps=int(1e6),  # total training steps

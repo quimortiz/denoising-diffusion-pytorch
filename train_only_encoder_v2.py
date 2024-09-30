@@ -160,9 +160,15 @@ sys.path.append("VAE-ResNet18-PyTorch")
 
 
 from model import  VAE as mVAE
+from model import  VAEpretrained
 
 
-vision_model = mVAE(z_dim=nz)
+# vision_model = mVAE(z_dim=nz)
+# vision_model = mVAE(z_dim=nz)
+
+use_mlp = True
+
+vision_model = VAEpretrained(z_dim=nz, use_mlp=use_mlp)
 
 model_size_gb = get_model_size(vision_model)
 print(f"Model size: {model_size_gb:.4f} GB")
@@ -204,7 +210,38 @@ dl = cycle(dl)
 
 
 
-opt = Adam(vision_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+# opt = Adam(vision_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+layer_4_fixed = False
+print(" layer 4  fixed" , layer_4_fixed)
+
+for param in vision_model.encoder.resnet.parameters():
+    param.requires_grad = False
+# Unfreeze the last few layers if needed
+if not layer_4_fixed:
+    for param in vision_model.encoder.resnet.layer4.parameters():
+        param.requires_grad = True
+
+# Learning Rate: Use a smaller learning rate for the pretrained layers and a larger one for the new layers.
+#
+# python
+
+
+params = []
+
+if not layer_4_fixed:
+    params += vision_model.encoder.resnet.layer4.parameters()
+if use_mlp:
+    params += vision_model.encoder.mlp.parameters()
+if not use_mlp:
+    params += vision_model.encoder.fc_mu.parameters()
+    params += vision_model.encoder.fc_logvar.parameters()
+params += vision_model.decoder.parameters()
+
+opt = torch.optim.Adam(
+    params
+)
+
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

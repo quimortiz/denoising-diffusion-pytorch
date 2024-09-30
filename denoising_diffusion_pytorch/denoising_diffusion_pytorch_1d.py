@@ -22,6 +22,7 @@ from ema_pytorch import EMA
 from tqdm.auto import tqdm
 
 from denoising_diffusion_pytorch.version import __version__
+from torch.nn.utils import clip_grad_norm_
 
 # constants
 
@@ -81,6 +82,23 @@ class Dataset1D(Dataset):
 
     def __getitem__(self, idx):
         return self.tensor[idx].clone()
+
+
+class Dataset1DCond(Dataset):
+    def __init__(self, tensor: Tensor, tensor_cond: Tensor):
+        super().__init__()
+        self.tensor = tensor.clone()
+        self.tensor_cond = tensor_cond.clone()
+        assert len(self.tensor) == len(self.tensor_cond), 'data and condition tensors must have the same length'
+
+    def __len__(self):
+        return len(self.tensor)
+
+    def __getitem__(self, idx):
+        return { "xu" :  self.tensor[idx].clone(), "y" : self.tensor_cond[idx].clone() }
+        
+
+
 
 # small helper modules
 
@@ -258,11 +276,14 @@ class Attention(Module):
 class Unet1D(Module):
     def __init__(
         self,
+        nx, 
+        nu,
         dim,
+        ny=0, 
         init_dim = None,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
-        channels = 3,
+        # channels = 3,
         dropout = 0.,
         self_condition = False,
         learned_variance = False,
@@ -271,15 +292,23 @@ class Unet1D(Module):
         learned_sinusoidal_dim = 16,
         sinusoidal_pos_emb_theta = 10000,
         attn_dim_head = 32,
-        attn_heads = 4
+        attn_heads = 4,
+        y_cond = None
     ):
         super().__init__()
 
         # determine dimensions
 
-        self.channels = channels
+        self.nx = nx
+        self.nu = nu
+        self.ny = ny
+
+        self.y_cond = ny > 0
+
+        self.channels = self.nx + self.nu
+
         self.self_condition = self_condition
-        input_channels = channels * (2 if self_condition else 1)
+        input_channels = self.channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv1d(input_channels, init_dim, 7, padding = 3)
@@ -306,6 +335,15 @@ class Unet1D(Module):
             nn.GELU(),
             nn.Linear(time_dim, time_dim)
         )
+
+        if self.y_cond : 
+
+            self.y_mlp = nn.Sequential(
+                nn.Linear(self.ny, time_dim),
+                nn.GELU(),
+                nn.Linear(time_dim, time_dim))
+            self.t_y_to_time = nn.Linear(time_dim * 2, time_dim)
+
 
         resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
 
@@ -340,13 +378,13 @@ class Unet1D(Module):
                 Upsample(dim_out, dim_in) if not is_last else  nn.Conv1d(dim_out, dim_in, 3, padding = 1)
             ]))
 
-        default_out_dim = channels * (1 if not learned_variance else 2)
+        default_out_dim = self.channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
 
         self.final_res_block = resnet_block(init_dim * 2, init_dim)
         self.final_conv = nn.Conv1d(init_dim, self.out_dim, 1)
 
-    def forward(self, x, time, x_self_cond = None):
+    def forward(self, x, time, x_self_cond = None,  y = None):
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
@@ -355,6 +393,12 @@ class Unet1D(Module):
         r = x.clone()
 
         t = self.time_mlp(time)
+
+        if self.y_cond :
+            assert y is not None, 'y must be passed if y_cond is True'
+
+        if self.y_cond:
+            t = self.t_y_to_time(torch.cat((t, self.y_mlp(y)), dim = 1))
 
         h = []
 
@@ -544,8 +588,8 @@ class GaussianDiffusion1D(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond)
+    def model_predictions(self, x, t, x_self_cond = None,  y = None, clip_x_start = False, rederive_pred_noise = False):
+        model_output = self.model(x, t, x_self_cond, y = y)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -569,8 +613,8 @@ class GaussianDiffusion1D(Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
+    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True, y = None):
+        preds = self.model_predictions(x, t, x_self_cond, y = y)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -580,16 +624,16 @@ class GaussianDiffusion1D(Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, x_self_cond = None, clip_denoised = True):
+    def p_sample(self, x, t: int, x_self_cond = None, clip_denoised = True, y = None):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = clip_denoised)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = clip_denoised, y =y)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, shape):
+    def p_sample_loop(self, shape, y = None):
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device=device)
@@ -598,7 +642,7 @@ class GaussianDiffusion1D(Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
+            img, x_start = self.p_sample(img, t, self_cond, y = y)
 
         img = self.unnormalize(img)
         return img
@@ -640,10 +684,10 @@ class GaussianDiffusion1D(Module):
         return img
 
     @torch.no_grad()
-    def sample(self, batch_size = 16):
+    def sample(self, batch_size = 16, y = None):
         seq_length, channels = self.seq_length, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, seq_length))
+        return sample_fn((batch_size, channels, seq_length ), y =y )
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -674,7 +718,7 @@ class GaussianDiffusion1D(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None):
+    def p_losses(self, x_start, t, y = None, noise = None):
         b, c, n = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -694,7 +738,7 @@ class GaussianDiffusion1D(Module):
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        model_out = self.model(x, t, x_self_cond, y = y)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -712,13 +756,13 @@ class GaussianDiffusion1D(Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
-    def forward(self, img, *args, **kwargs):
+    def forward(self, img, y = None ,*args, **kwargs,):
         b, c, n, device, seq_length, = *img.shape, img.device, self.seq_length
         assert n == seq_length, f'seq length must be {seq_length}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        return self.p_losses(img, t, y = y,  *args, **kwargs)
 
 # trainer class
 
@@ -742,17 +786,19 @@ class Trainer1D(object):
         mixed_precision_type = 'fp16',
         split_batches = True,
         max_grad_norm = 1.,
-        callback = None
+        callback = None,
+        device = torch.device('cpu')
     ):
         super().__init__()
         self.callback = callback
+        self.device = device
 
         # accelerator
 
-        self.accelerator = Accelerator(
-            split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
-        )
+        # self.accelerator = Accelerator(
+        #     split_batches = split_batches,
+        #     mixed_precision = mixed_precision_type if amp else 'no'
+        # )
 
         # model
 
@@ -773,9 +819,10 @@ class Trainer1D(object):
 
         # dataset and dataloader
 
-        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 1,
+                        drop_last=True)
 
-        dl = self.accelerator.prepare(dl)
+        # dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
         # optimizer
@@ -784,9 +831,9 @@ class Trainer1D(object):
 
         # for logging results in a folder periodically
 
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
+        # if self.accelerator.is_main_process:
+        self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+        self.ema.to(self.device)
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
@@ -797,52 +844,52 @@ class Trainer1D(object):
 
         # prepare model, dataloader, optimizer with accelerator
 
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        # self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
-    @property
-    def device(self):
-        return self.accelerator.device
+    # @property
+    # def device(self):
+    #     return self.device
 
     def save(self, milestone):
-        if not self.accelerator.is_local_main_process:
-            return
+        # if not self.accelerator.is_local_main_process:
+        #     return
 
         data = {
             'step': self.step,
-            'model': self.accelerator.get_state_dict(self.model),
+            'model': self.model.state_dict(),
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+            # 'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__
         }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
-        accelerator = self.accelerator
-        device = accelerator.device
+        # accelerator = self.accelerator
+        device = self.device
 
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
 
-        model = self.accelerator.unwrap_model(self.model)
+        model = self.model
         model.load_state_dict(data['model'])
 
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
-        if self.accelerator.is_main_process:
-            self.ema.load_state_dict(data["ema"])
+        # if self.accelerator.is_main_process:
+        self.ema.load_state_dict(data["ema"])
 
         if 'version' in data:
             print(f"loading from version {data['version']}")
 
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
-            self.accelerator.scaler.load_state_dict(data['scaler'])
+        # if exists(self.accelerator.scaler) and exists(data['scaler']):
+        #     self.accelerator.scaler.load_state_dict(data['scaler'])
 
     def train(self):
-        accelerator = self.accelerator
-        device = accelerator.device
+        # accelerator = self.accelerator
+        device = self.device
 
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+        with tqdm(initial = self.step, total = self.train_num_steps) as pbar:
 
             while self.step < self.train_num_steps:
                 self.model.train()
@@ -850,44 +897,65 @@ class Trainer1D(object):
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
+                    data_xu = next(self.dl)["xu"].to(device)
+                    data_y = next(self.dl)["y"].to(device)
+                    assert data_y.shape[0] == data_xu.shape[0], 'data_y and data_xu must have the same batch size'
 
-                    with self.accelerator.autocast():
-                        loss = self.model(data)
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
+                    # with self.accelerator.autocast():
+                    loss = self.model(data_xu, y=data_y)
+                    loss = loss / self.gradient_accumulate_every
+                    total_loss += loss.item()
 
-                    self.accelerator.backward(loss)
+                    # self.accelerator.
+                    loss.backward()
+                    # backward(loss)
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
 
-                accelerator.wait_for_everyone()
-                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                # accelerator.wait_for_everyone()
+                # accelerator.
+                clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                 self.opt.step()
                 self.opt.zero_grad()
 
-                accelerator.wait_for_everyone()
+                # accelerator.wait_for_everyone()
 
                 self.step += 1
-                if accelerator.is_main_process:
-                    self.ema.update()
+                # if accelerator.is_main_process:
+                self.ema.update()
 
-                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                        self.ema.ema_model.eval()
+                if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                    self.ema.ema_model.eval()
 
-                        with torch.no_grad():
-                            milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                    milestone = self.step // self.save_and_sample_every
+                    # with torch.no_grad():
+                    #     milestone = self.step // self.save_and_sample_every
+                        # batches = num_to_groups(self.num_samples, self.batch_size)
+                        # all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n,
+                        #                                                                 y = data_y[:n] if data_y is not None else None), batches))
+                        # all-
+                    #
+                    #     all_samples = self.ema.ema_model.sample(
+                    #         batch_size=self.num_samples,
+                    #         y = data_y[:self.num_samples] if data_y is not None else None)
+                    #
+                    #     # lets get the first 5 ys and repeat interleave 
+                    #     y = data_y[:5].repeat_interleave(4, dim = 0)
+                    #     all_samples_cond = self.ema.ema_model.sample(
+                    #         batch_size=y.shape[0],
+                    #         y = y)
+                    #
+                    #
+                    # # all_samples = torch.cat(all_samples_list, dim = 0)
+                    #
+                    # if self.callback is not None:
+                    #     self.callback(all_samples, milestone)
+                    #     self.callback()
 
-                        all_samples = torch.cat(all_samples_list, dim = 0)
-
-                        if self.callback is not None:
-                            self.callback(all_samples, milestone)
-
-                        torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
-                        self.save(milestone)
+                    # torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                    self.callback(self.ema.ema_model,milestone)
+                    self.save(milestone)
 
 
 
