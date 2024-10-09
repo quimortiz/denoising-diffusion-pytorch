@@ -1,37 +1,31 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset
 from einops import rearrange
 from torchvision import utils
 import random
 import string
-import argparse
 import pathlib
+import sys
+import datetime
+
+# Add custom module paths
+sys.path.append("resnet-18-autoencoder/src")  # Adjust as needed
 
 from vision_model.model import VanillaVAE
-
-import einops
-
-import torch.nn.functional as F
-from einops import rearrange, reduce
-from torch.utils.data import Dataset
-
-import sys  # noqa
-
-sys.path.append("resnet-18-autoencoder/src")  # noqa
 from classes.resnet_autoencoder import AE
 
+# Import Hydra
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from hydra.utils import instantiate, to_absolute_path
 
-# Define MLPForwardModel as above
+# Import TensorBoard SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
-torch.set_num_threads(1)
-
-import torch
-from torch.utils.data import DataLoader
 from collections import defaultdict
-from typing import List, Dict, Any, Union
-import torch
+from typing import List, Dict, Any
 import numpy as np
 
 
@@ -176,9 +170,6 @@ class MLPForwardModel(nn.Module):
         return next_state
 
 
-# Define TrajectoryDataset as above
-
-
 class TrajectoryDataset(Dataset):
     def __init__(self, imgs, us, xs):
         """
@@ -199,422 +190,101 @@ class TrajectoryDataset(Dataset):
         return {"imgs": self.imgs[idx], "us": self.us[idx], "xs": self.xs[idx]}
 
 
+class TrajectoryDatasetDisk(Dataset):
+    def __init__(self, base_path, file_list):
+        """
+        trajs_latent: Tensor of shape (batch_size, channels, total_sequence_length)
+        us: Tensor of shape (batch_size, control_channels, total_sequence_length)
+        sequence_length: Number of steps in each sample (e.g., 5 steps)
+        """
+        self.file_list = file_list
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        data = torch.load(self.file_list[idx])
+        return data
+
+
+
 def generate_exp_id():
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
 
 
-# TODO: continue from here!! -- check this out!
-def generate_special_trajectories(
-    model, test_trajs_latent, test_data_us, vision_model, N, M, results_folder, epoch
-):
-    """
-    Generates M trajectories, each is a concatenation of N trajectories.
-
-    Args:
-        model: The forward model.
-        test_trajs_latent: Tensor of shape (num_test_trajectories, channels, seq_length).
-        test_data_us: Tensor of shape (num_test_trajectories, control_channels, seq_length).
-        vision_model: VAE model for decoding latent states to images.
-        N: Number of concatenations per trajectory.
-        M: Number of trajectories to generate.
-        results_folder: Folder to save the generated trajectory images.
-        epoch: Current epoch number (for naming saved images).
-    """
-    model.eval()
-    vision_model.eval()
-    device = next(model.parameters()).device
-    vision_device = next(vision_model.parameters()).device
-
-    with torch.no_grad():
-        num_trajectories, channels, seq_length = test_trajs_latent.shape
-        control_channels = test_data_us.shape[1]
-
-        # Precompute the start states of all test trajectories
-        start_states = test_trajs_latent[:, :, 0].to(
-            device
-        )  # Shape: (num_trajectories, C)
-
-        generated_trajectories = []
-
-        for m in range(M):
-            # Select a random starting trajectory index from the test set
-            traj_idx = random.randint(0, num_trajectories - 1)
-            start_state = test_trajs_latent[traj_idx, :, 0].to(device)  # Shape: (C,)
-            # print(f"Trajectory {m+1}/{M}: Selected starting trajectory index: {traj_idx}")
-
-            generated_states = [start_state]
-            current_state = start_state
-
-            for n in range(N):
-                # Compute distances between current_state and all test start states
-                distances = torch.norm(start_states - current_state.unsqueeze(0), dim=1)
-
-                # Find the index of the closest trajectory
-                closest_idx = torch.argmin(distances).item()
-                print(
-                    f"Trajectory {m+1}, Step {n+1}/{N}: Closest trajectory index: {closest_idx} with distance: {distances[closest_idx].item():.4f}"
-                )
-
-                # Retrieve the control inputs from the closest trajectory
-                controls = test_data_us[
-                    closest_idx
-                ]  # Shape: (control_channels, seq_length)
-
-                # Apply the control inputs step by step
-                for u in controls.permute(
-                    1, 0
-                ):  # Transpose to get shape (seq_length, control_channels)
-                    # Apply the control input to predict the next state
-                    current_state = model(
-                        current_state.unsqueeze(0), u.unsqueeze(0)
-                    ).squeeze(
-                        0
-                    )  # Shape: (C,)
-                    generated_states.append(current_state)
-
-                print(
-                    f"Trajectory {m+1}, Step {n+1}/{N}: Applied control inputs and predicted next states."
-                )
-
-            # Stack the generated states into a tensor and add to the list
-            generated_states_tensor = torch.stack(
-                generated_states
-            )  # Shape: (total_length, C)
-            generated_trajectories.append(generated_states_tensor)
-
-        # Stack all trajectories into a tensor
-        generated_trajectories_tensor = torch.stack(
-            generated_trajectories
-        )  # Shape: (M, total_length, C)
-
-        # Reshape for decoding
-        M, total_length, C = generated_trajectories_tensor.shape
-        decoded_imgs = vision_model.decode(
-            generated_trajectories_tensor.view(-1, C).to(vision_device)
-        )
-
-        # Save the images with each row representing a trajectory
-        fout = str(results_folder / f"special-trajectories-epoch-{epoch+1:05d}.png")
-        print(f"Saving special trajectories visualization to {fout}")
-        utils.save_image(decoded_imgs.cpu(), fout, nrow=total_length)
+OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
-def generate_special_trajectory(
-    model, test_trajs_latent, test_data_us, vision_model, N, results_folder, epoch
-):
-    """
-    Generates a special trajectory by selecting control inputs from the closest matching trajectories.
+@hydra.main(
+    config_path="configs/autoencoder_fwd", config_name="config", version_base=None
+)
+def main(config: DictConfig):
+    print("Configuration:\n", OmegaConf.to_yaml(config))
 
-    Args:
-        model: The forward model.
-        test_trajs_latent: Tensor of shape (num_test_trajectories, channels, seq_length).
-        test_data_us: Tensor of shape (num_test_trajectories, control_channels, seq_length).
-        vision_model: VAE model for decoding latent states to images.
-        N: Number of steps to generate.
-        results_folder: Folder to save the generated trajectory images.
-        epoch: Current epoch number (for naming saved images).
-    """
-    model.eval()  # Set model to evaluation mode
-    device = next(model.parameters()).device
-    vision_device = next(vision_model.parameters()).device
-    with torch.no_grad():
-        num_trajectories, channels, seq_length = test_trajs_latent.shape
-        control_channels = test_data_us.shape[1]
+    # Set random seed for reproducibility
+    random_seed = config.training.seed
+    torch.manual_seed(random_seed)
+    random.seed(random_seed)
 
-        # Select a random trajectory index from the test set
-        traj_idx = random.randint(0, num_trajectories - 1)
-        start_state = test_trajs_latent[traj_idx, :, 0].to(device)  # Shape: (C,)
-        # print(f"Selected starting trajectory index: {traj_idx}")
-
-        generated_states = [start_state]
-        current_state = start_state
-
-        start_states = test_trajs_latent[:, :, 0].to(
-            device
-        )  # Shape: (num_trajectories, C)
-        for step in range(N):
-            # Compute distances between current_state and all test start states
-            # test_trajs_latent[:, :, 0] has shape (num_trajectories, C)
-            distances = torch.norm(
-                start_states - current_state.unsqueeze(0), dim=1
-            )  # Shape: (num_trajectories,)
-
-            # Find the index of the closest trajectory
-            closest_idx = torch.argmin(distances).item()
-            # print(f"Step {step+1}: Closest trajectory index: {closest_idx} with distance: {distances[closest_idx].item():.4f}")
-            #
-            # Retrieve the control inputs from the closest trajectory
-            controls = test_data_us[
-                closest_idx
-            ]  # Shape: (control_channels, seq_length)
-
-            # Select the control input corresponding to the current step
-            # To avoid index out of range, use modulo
-            for u in torch.transpose(controls, 0, 1):
-                # Apply the control input to predict the next state
-                current_state = model(
-                    current_state.unsqueeze(0), u.unsqueeze(0)
-                ).squeeze(
-                    0
-                )  # Shape: (C,)
-                generated_states.append(current_state)
-
-            # print(f"Step {step+1}: Applied control input and predicted next states.")
-
-        # Stack the generated states into a tensor of shape (1, C, N+1)
-        generated_states_tensor = torch.stack(generated_states)
-
-        # Decode the generated latent states to images
-        decoded_imgs = vision_model.decode(
-            generated_states_tensor.to(vision_device)
-        )  # Shape: (1, C, N+1)
-
-        # Rearrange to (B*(N+1), C)
-        # decoded_imgs = rearrange(decoded_imgs, "b c seq -> (b seq) c")
-
-        # Save the images
-        fout = str(results_folder / f"special-trajectory-epoch-{epoch+1:05d}.png")
-        # print(f"saving special trajectory visualization to {fout}")
-        utils.save_image(decoded_imgs.cpu(), fout, nrow=16)  # Arrange images in a row
-
-
-def evaluate_model(
-    model,
-    dataloader,
-    criterion,
-    sequence_length,
-    noise_z,
-    noise_u,
-    one_step_weight,
-    multi_step_weight,
-    tag="",
-    vision_model=None,
-    save_images=False,
-    results_folder=None,
-    epoch=None,
-):
-    """
-    Evaluates the model on the provided dataloader.
-
-    Args:
-        model: The forward model to evaluate.
-        dataloader: DataLoader for the dataset (train or test).
-        criterion: Loss function.
-        device: Device to run the evaluation on.
-        sequence_length: Number of steps in each sample.
-        noise_z: Noise weight for z.
-        noise_u: Noise weight for u.
-        one_step_weight: Weight for one-step loss.
-        multi_step_weight: Weight for multi-step loss.
-        vision_model: VAE model for decoding (required if save_images is True).
-        save_images: Whether to save predicted images.
-        results_folder: Folder to save images.
-        epoch: Current epoch number (for naming saved images).
-
-    Returns:
-        avg_total_loss: Combined weighted loss.
-        avg_loss_one_step: Average one-step loss.
-        avg_loss_multi_step: Average multi-step loss.
-    """
-    model.eval()  # Set model to evaluation mode
-    total_loss_one_step = 0.0
-    total_loss_multi_step = 0.0
-    total_samples = 0
-
-    # To handle image saving, we can use the first batch
-    images_saved = False
-    device = next(model.parameters()).device
-    device_vision = (
-        next(vision_model.parameters()).device if vision_model is not None else None
+    vision_model = instantiate(config.vision_model.model)
+    vision_model = vision_model.to(
+        torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
-    with torch.no_grad():
-        for batch_idx, (states, controls) in enumerate(dataloader):
-            states = states.to(device)
-            controls = controls.to(device)
-
-            batch_size, channels, seq_length = states.shape
-            control_channels = controls.shape[1]
-
-            # One-step prediction
-            current_state = states[:, :, 0]  # Shape: (batch_size, channels)
-            control_input = controls[:, :, 0]  # Shape: (batch_size, control_channels)
-            next_state = states[:, :, 1]  # Shape: (batch_size, channels)
-
-            predicted_next_state = model(
-                current_state + noise_z * torch.randn_like(current_state),
-                control_input + noise_u * torch.randn_like(control_input),
-            )
-            loss_one_step = criterion(predicted_next_state, next_state)
-
-            # Multi-step predictions
-            predicted_states = [current_state, predicted_next_state]
-            for t in range(1, sequence_length - 1):
-                control_input_t = controls[:, :, t]
-                predicted_next = model(
-                    predicted_states[-1]
-                    + noise_z * torch.randn_like(predicted_states[-1]),
-                    control_input_t + noise_u * torch.randn_like(control_input_t),
-                )
-                predicted_states.append(predicted_next)
-
-            # Compute multi-step loss
-            loss_multi_step = 0.0
-            for t in range(1, sequence_length):
-                loss_t = criterion(predicted_states[t], states[:, :, t])
-                loss_multi_step += loss_t
-
-            total_loss_one_step += loss_one_step.item() * batch_size
-            total_loss_multi_step += loss_multi_step.item() * batch_size
-            total_samples += batch_size
-
-            # Save images for the first batch if required
-            if save_images and not images_saved:
-                if (
-                    vision_model is not None
-                    and results_folder is not None
-                    and epoch is not None
-                ):
-                    predicted_states_tensor = torch.stack(
-                        predicted_states, dim=2
-                    )  # Shape: (B, C, Seq)
-                    # Decode the predicted latent states to images
-                    imgs = vision_model.decode(
-                        rearrange(predicted_states_tensor, "b c seq -> (b seq) c").to(
-                            device_vision
-                        )
-                    ).cpu()
-                    # Save the images
-                    fout = str(
-                        results_folder / f"sample-imgs-{tag}-epoch-{epoch+1:05d}.png"
-                    )
-                    # print(f"Saving sample images to {fout}")
-                    utils.save_image(imgs, fout, nrow=sequence_length)
-                    images_saved = True
-
-    avg_loss_one_step = total_loss_one_step / total_samples
-    avg_loss_multi_step = total_loss_multi_step / total_samples
-    avg_total_loss = (
-        one_step_weight * avg_loss_one_step + multi_step_weight * avg_loss_multi_step
-    )
-
-    return avg_total_loss, avg_loss_one_step, avg_loss_multi_step
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument(
-        "--exp_id", type=str, default=generate_exp_id(), help="Experiment ID"
-    )
-    parser.add_argument("--pretrained", action="store_true", help="Use pretrained VAE")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument(
-        "--train_num_steps", type=int, default=100000, help="Number of training steps"
-    )
-    parser.add_argument(
-        "--fix_encoder", action="store_true", help="Fix the VAE encoder"
-    )
-    parser.add_argument("--resnet", action="store_true", help="Use ResNet encoder")
-    parser.add_argument(
-        "--noise_z", type=float, default=1e-2, help="Noise weight for z"
-    )
-    parser.add_argument(
-        "--noise_u", type=float, default=1e-2, help="Noise weight for u"
-    )
-    parser.add_argument(
-        "--weight_decay", type=float, default=0.0, help="Weight decay for optimizer"
-    )
-    parser.add_argument(
-        "--z_predict", type=float, default=1e-1, help="Weight for z prediction loss"
-    )
-    parser.add_argument(
-        "--z_reg", type=float, default=1e-5, help="Weight for z regularization loss"
-    )
-
-    args = parser.parse_args()
-    print(args)
-
-    nu = 2
-    nz = 12  # Latent dimension
-    n_elements = 1
-
-    # Initialize Vision Model
-    if args.resnet:
-        vision_model = AE("light", nz=nz)  # Ensure this is correctly implemented
-    else:
-        vision_model = VanillaVAE(in_channels=3, latent_dims=nz, size=64)
-
-    # # Load Pretrained Weights if specified
-    # if args.size == 32:
-    #     path = "results/i2n6ce/model-95000.pt"
-    #     vision_model.load_state_dict(torch.load(path)["model"])
-    # elif args.size == 64:
-    #     # path = "results/la90ra/model-995000.pt"  # Adjust the path as needed
-    #     # path = "results/la90ra/model-490000.pt"  # the original i was using
-    #     path = "results/z91yo7/model-990000.pt"  # the one i used for the 64x64
-    #     path = "results/y6owhr/model-460000.pt"
-    #     print("Loading model from ", path, "...")
-    #     vision_model.load_state_dict(torch.load(path)["model"])
-    # elif args.size == 224:
-    #     path = "path_to_pretrained_model_for_224.pt"  # Provide the correct path
-    #     print("Loading model from ", path, "...")
-    #     vision_model.load_state_dict(torch.load(path)["model"])
-    # else:
-    #     raise ValueError(f"Unsupported size {args.size} for pretrained model.")
 
     vision_model.eval()  # Set to evaluation mode
 
     # Encode data using the vision model
-    device_model = "cpu"
-    device_vision = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vision_model = vision_model.to(device)
 
-    device_model = device_vision = device = "cuda"
+    # data_in = to_absolute_path(config.data_path)
+    # data_in = torch.load(data_in)
+    # imgs = data_in["imgs"]
+    # us = data_in["us"]
+    # xs = data_in["xs"]
 
-    vision_model = vision_model.to(device_vision)
+    data_folder = config.data_folder
 
-    data_in = "./new_data_all_2024-09-05.pt"
-    data_in = torch.load(data_in)
-    imgs = data_in["imgs"]
-    us = data_in["us"]
-    xs = data_in["xs"]
+    # get how many files are in data_folder
+    num_trajs = len(list(pathlib.Path(data_folder).rglob("*.pt")))
+    print(num_trajs, "num_trajs")
 
-    # data = torch.load("trajs_latent_all_v1.pt")
-    # data = torch.load("trajs_latent_all_z91yo7.pt")
-    # v1.pt")
-    # generate the data using the vision model
 
-    # trajs_latent = data["zs"]
-    # trajs_x = data["xs"]
-    # data_us = data["us"]
+    # for i in range(len(imgs)):
+    #     fileout = data_folder + f"/traj_{i:05d}.pt"
+    #     pathlib.Path(fileout).parent.mkdir(parents=True, exist_ok=True)
+    #     print("saving to ", fileout)
+    #     torch.save(
+    #         {
+    #             "imgs": imgs[i].clone(),
+    #             "us": us[i].clone(),
+    #             "xs": xs[i].clone(),
+    #         },
+    #         fileout
+    #     )
 
-    print("before")
-    print("max in data_us", torch.max(us))
-    print("min in data_us", torch.min(us))
-    print("sum squares ", torch.sum(us**2))
+    # sys.exit()
+    # imgs = imgs[:, ::2 , ...].clone()
+    # us = us[:, ::2 , ...].clone()
+    # xs = xs[:, ::2 , ...].clone()
+    #
+    # torch.save(
+    #     {
+    #         "imgs": imgs,
+    #         "us": us,
+    #         "xs": xs,
+    #
+    #     },
+    #     config.data_path + "_downsampled.pt",
+    # )
+    #
+    # sys.exit()
 
-    # data_us = data_us[:,:,:] - data_xs[:,:,3:5]
+    num_trajectories = num_trajs
 
-    print("after")
-    print("max in data_us", torch.max(us))
-    print("min in data_us", torch.min(us))
-    print("sum squares ", torch.sum(us**2))
-
-    # data_us = einops.rearrange(data_us, "b seq c -> b c seq")
-
-    # Rearrange to (B, channels, seq)
-    # trajs_latent = rearrange(trajs_latent, "b seq c -> b c seq")
-
-    # -------------------- Data Splitting Begins Here -------------------- #
-
-    # Set random seed for reproducibility
-    random_seed = 42
-    torch.manual_seed(random_seed)
-    random.seed(random_seed)
-
-    num_trajectories = imgs.shape[0]
-
-    test_size = int(0.05 * num_trajectories)  # 5% for testing
+    test_size = int(
+        config.training.test_size_ratio * num_trajectories
+    )  # Define test_size_ratio in config
     train_size = num_trajectories - test_size
 
     # Generate shuffled indices
@@ -626,33 +296,41 @@ def main():
 
     # Create Dataset instances
 
-    train_dataset = TrajectoryDataset(
-        imgs=imgs[train_indices],
-        xs=xs[train_indices],
-        us=us[train_indices],
-    )
-    test_dataset = TrajectoryDataset(
-        imgs=imgs[test_indices],
-        xs=xs[test_indices],
-        us=us[test_indices],
-    )
+    # train_dataset = TrajectoryDataset(
+    #     imgs=imgs[train_indices],
+    #     xs=xs[train_indices],
+    #     us=us[train_indices],
+    # )
+
+
+    train_dataset = TrajectoryDatasetDisk(data_folder, [f"{data_folder}/traj_{i:05d}.pt" for i in train_indices])
+
+    test_dataset = TrajectoryDatasetDisk(data_folder, [f"{data_folder}/traj_{i:05d}.pt" for i in test_indices])
+
+    # test_dataset = TrajectoryDataset(
+    #     imgs=imgs[test_indices],
+    #     xs=xs[test_indices],
+    #     us=us[test_indices],
+    # )
+
+    # del imgs, xs, us, data_in
 
     # Create DataLoader instances
     dataloader_train = DataLoader(
         train_dataset,
-        batch_size=16,
+        batch_size=config.training.batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=config.training.num_workers,
+        pin_memory=False,
         drop_last=True,
     )
 
     dataloader_test = DataLoader(
         test_dataset,
-        batch_size=16,
+        batch_size=config.training.batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=config.training.num_workers,
+        pin_memory=False,
         drop_last=True,
     )
 
@@ -661,43 +339,47 @@ def main():
 
     # -------------------- Data Splitting Ends Here -------------------- #
 
-    # Initialize Forward Model
-    input_dim = nz + nu  # Latent dimension + control input dimension
-    hidden_dim = 128
-    output_dim = nz  # Predicting next latent state
-
-    forward_model = MLPForwardModel(input_dim, hidden_dim, output_dim, num_layers=4).to(
-        device_model
-    )
+    # Instantiate Forward Model using Hydra
+    forward_model = instantiate(config.fwd_model.model).to(device)
 
     # Define Loss Function
     criterion = nn.MSELoss()
 
     # Optionally, fix the encoder if specified
-    params = []
     params = list(forward_model.parameters())
-    if args.fix_encoder:
+    if config.training.fix_encoder:
         for param in vision_model.parameters():
             param.requires_grad = False
     else:
         params += list(vision_model.parameters())
 
     # Define Optimizer
-    optimizer = optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = optim.Adam(
+        params, lr=config.training.lr, weight_decay=config.training.weight_decay
+    )
+
     # Training Loop
-    num_epochs = args.train_num_steps // len(dataloader_train) + 1
+    num_epochs = config.training.train_num_steps // len(dataloader_train) + 1
     forward_model.train()
     vision_model.train()
 
-    results_folder = pathlib.Path(f"results/{args.exp_id}")
+    exp_id = generate_exp_id()
+    print("experiment id: ", exp_id)
+
+    # get time stamp in format YYYY-MM-DD--HH-MM-SS
+    time_stamp = datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S")
+
+    results_folder = pathlib.Path(f"results/{exp_id}")
     (results_folder / "imgs").mkdir(parents=True, exist_ok=True)
     (results_folder / "checkpoints").mkdir(parents=True, exist_ok=True)
 
-    # Compute multi-step loss
-    img_recon = 1.0
-    img_predict = 1.0
-    z_predict = args.z_predict
-    z_reg = args.z_reg
+    # Initialize TensorBoard SummaryWriter
+    writer = SummaryWriter(log_dir=to_absolute_path(f"runs/{exp_id}__{time_stamp}"))
+
+    img_recon_weight = config.training.img_recon
+    img_predict_weight = config.training.img_predict
+    z_predict_weight = config.training.z_predict
+    z_reg_weight = config.training.z_reg
 
     def compute(data):
         xs = data["xs"].to(device)
@@ -705,14 +387,18 @@ def main():
         imgs = data["imgs"].to(device)
         sequence_length = xs.shape[1]
 
+        _imgs = imgs + config.training.noise_img * torch.randn_like(imgs)
+
         zs = rearrange(
-            vision_model.encode(rearrange(imgs, "b seq ... -> (b seq) ..."))[0],
+            vision_model.encode(rearrange(_imgs, "b seq ... -> (b seq) ..."))[0],
             "(b seq) ... -> b seq ...",
             seq=sequence_length,
         )
 
+        _zs = zs + config.training.noise_z * torch.randn_like(zs)
+
         imgs_recon = rearrange(
-            vision_model.decode(rearrange(zs, "b seq ... -> (b seq) ...")),
+            vision_model.decode(rearrange(_zs, "b seq ... -> (b seq) ...")),
             "(b seq) ... -> b seq ...",
             seq=sequence_length,
         )
@@ -724,50 +410,46 @@ def main():
         for t in range(1, sequence_length):
             control_input_t = us[:, t, :]
             predicted_z = forward_model(
-                predicted_zs[-1] + args.noise_z * torch.randn_like(predicted_zs[-1]),
-                control_input_t + args.noise_u * torch.randn_like(control_input_t),
+                predicted_zs[-1]
+                + config.training.noise_z * torch.randn_like(predicted_zs[-1]),
+                control_input_t
+                + config.training.noise_u * torch.randn_like(control_input_t),
             )
             predicted_zs.append(predicted_z)
 
         predicted_zs = torch.stack(predicted_zs, dim=1)
 
-        # print("predicted_zs", predicted_zs.shape)
+        # Decode predicted zs to images
         imgs_predicted = rearrange(
             vision_model.decode(rearrange(predicted_zs, "b seq ... -> (b seq) ...")),
             "(b seq) ... -> b seq ...",
             seq=sequence_length,
         )
-        # print(imgs_predicted.shape)
 
-        loss_multistep_z = torch.tensor(0.0).to(device)
-        loss_multistep_img = torch.tensor(0.0).to(device)
-
-        # for t in range(sequence_length):
+        # Compute losses
         loss_z = criterion(predicted_zs, zs)
         loss_img = criterion(imgs_predicted, imgs)
-        loss_multistep_z += loss_z
-        loss_multistep_img += loss_img
 
         # Combine losses
         loss_img_recon = criterion(imgs_recon, imgs)
         total_loss = (
-            z_predict * loss_multistep_z
-            + img_predict * loss_multistep_img
-            + img_recon * loss_img_recon
+            z_predict_weight * loss_z
+            + img_predict_weight * loss_img
+            + img_recon_weight * loss_img_recon
         )
-        total_loss += z_reg * torch.mean(zs**2)
+        total_loss += z_reg_weight * torch.mean(zs**2)
 
         return {
             "loss": {
                 "total_loss": total_loss,
-                "loss_multistep_z": loss_multistep_z,
-                "loss_multistep_img": loss_multistep_img,
+                "loss_multistep_z": loss_z,
+                "loss_multistep_img": loss_img,
                 "loss_img_recon": loss_img_recon,
                 "z_reg": torch.mean(zs**2),
-                "w_loss_multistep_z": z_predict * loss_multistep_z,
-                "w_loss_multistep_img": img_predict * loss_multistep_img,
-                "w_loss_img_recon": img_recon * loss_img_recon,
-                "w_z_reg": z_reg * torch.mean(zs**2),
+                "w_loss_multistep_z": z_predict_weight * loss_z,
+                "w_loss_multistep_img": img_predict_weight * loss_img,
+                "w_loss_img_recon": img_recon_weight * loss_img_recon,
+                "w_z_reg": z_reg_weight * torch.mean(zs**2),
             },
             "imgs_recon": imgs_recon,
             "imgs_predicted": imgs_predicted,
@@ -781,7 +463,7 @@ def main():
             str_out += f"{key}: {value.item():.3e}  "
         print(str_out)
 
-    def save_images(out, tag):
+    def save_images(out, tag, epoch):
         imgs = out["imgs"]
         imgs_recon = out["imgs_recon"]
         imgs_predicted = out["imgs_predicted"]
@@ -807,11 +489,32 @@ def main():
             nrow=sequence_length,
         )
 
-    print("experiment id: ", args.exp_id)
+        # Log images to TensorBoard
+        # Select a subset to log (e.g., first 4 images)
+        num_images_to_log = min(4, imgs.shape[0])
+        grid_orig = utils.make_grid(
+            rearrange(imgs[:num_images_to_log], "b seq c h w -> (b seq) c h w"),
+            nrow=sequence_length,
+        )
+        grid_recon = utils.make_grid(
+            rearrange(imgs_recon[:num_images_to_log], "b seq c h w -> (b seq) c h w"),
+            nrow=sequence_length,
+        )
+        grid_pred = utils.make_grid(
+            rearrange(
+                imgs_predicted[:num_images_to_log], "b seq c h w -> (b seq) c h w"
+            ),
+            nrow=sequence_length,
+        )
+
+        writer.add_image(f"Original Images/{tag}", grid_orig, global_step=epoch)
+        writer.add_image(f"Reconstructed Images/{tag}", grid_recon, global_step=epoch)
+        writer.add_image(f"Predicted Images/{tag}", grid_pred, global_step=epoch)
+
     for epoch in range(num_epochs):
 
         forward_model.train()  # Ensure model is in training mode
-        if args.fix_encoder:
+        if config.training.fix_encoder:
             vision_model.eval()
         else:
             vision_model.train()
@@ -833,7 +536,15 @@ def main():
                 )
                 loss_info(out["loss"])
 
-        # get a batch from the test set.
+                # Log training losses to TensorBoard
+                for loss_name, loss_value in out["loss"].items():
+                    writer.add_scalar(
+                        f"Train/{loss_name}",
+                        loss_value.item(),
+                        epoch * len(dataloader_train) + batch_idx,
+                    )
+
+        # Get a batch from the test set.
         vision_model.eval()
         forward_model.eval()
         with torch.no_grad():
@@ -846,24 +557,46 @@ def main():
             print(f"Epoch {epoch+1}/{num_epochs} -- test set")
             loss_info(info)
 
-            out = compute(train_small_eval)
-            save_images(out, f"train-e{epoch+1:05d}")
+            # Log test losses to TensorBoard
+            for loss_name, loss_value in info.items():
+                writer.add_scalar(f"Test/{loss_name}", loss_value.item(), epoch + 1)
 
-            out = compute(test_small_eval)
-            save_images(out, f"test-e{epoch+1:05d}")
+            # Save and log images with epoch number
+            out_train = compute(train_small_eval)
+            save_images(out_train, f"train-e{epoch+1:05d}", epoch + 1)
 
+            out_test = compute(test_small_eval)
+            save_images(out_test, f"test-e{epoch+1:05d}", epoch + 1)
+
+        # Save model checkpoint
         fout = results_folder / f"checkpoints/model-epoch-{epoch+1:05d}.pt"
         torch.save(
             {
                 "fwd_state_dict": forward_model.state_dict(),
                 "fwd_model": forward_model,
                 "vision_state_dict": vision_model.state_dict(),
-                "vison_model": vision_model,
+                "vision_model": vision_model,
             },
             str(fout),
         )
 
     print("Training completed!")
+
+    # After training, log hyperparameters and final metrics
+    metric_dict = {
+        "final_total_loss": info["total_loss"].item(),
+        "final_loss_multistep_z": info["loss_multistep_z"].item(),
+        "final_loss_multistep_img": info["loss_multistep_img"].item(),
+        "final_loss_img_recon": info["loss_img_recon"].item(),
+        "final_z_reg": info["z_reg"].item(),
+    }
+
+    writer.add_hparams(
+        OmegaConf.to_container(config.training, resolve=True), metric_dict
+    )
+
+    # Close the TensorBoard writer
+    writer.close()
 
 
 if __name__ == "__main__":
