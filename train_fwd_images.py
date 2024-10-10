@@ -149,9 +149,12 @@ def mean_of_dicts(list_of_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 class MLPForwardModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=3):
+    def __init__(self, nz, nu,  hidden_dim=64, num_layers=3):
         super(MLPForwardModel, self).__init__()
         layers = []
+        input_dim = nz + nu
+        hidden_dim = nz
+        output_dim = nz
         layers.append(nn.Linear(input_dim, hidden_dim))
         layers.append(nn.ReLU())
         for _ in range(num_layers - 2):
