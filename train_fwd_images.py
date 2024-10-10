@@ -353,6 +353,7 @@ def main(config: DictConfig):
     img_predict_weight = config.training.img_predict
     z_predict_weight = config.training.z_predict
     z_reg_weight = config.training.z_reg
+    repulsion_weight = config.training.repulsion
 
     def compute(data):
         xs = data["xs"].to(device)
@@ -410,7 +411,19 @@ def main(config: DictConfig):
             + img_predict_weight * loss_img
             + img_recon_weight * loss_img_recon
         )
+
+        z_first = zs[:, 0, :]
+        # New loss term: Maximize distance between first states
+        distances = torch.cdist(z_first, z_first, p=2)
+        mask = ~torch.eye(z_first.size(0), device=device).bool()
+        avg_distance = distances[mask].mean()
+        max_first_dist_loss = -avg_distance  # Negative for maximization
+
+
+
+
         total_loss += z_reg_weight * torch.mean(zs**2)
+        total_loss += repulsion_weight * max_first_dist_loss
 
         return {
             "loss": {
@@ -419,10 +432,12 @@ def main(config: DictConfig):
                 "loss_multistep_img": loss_img,
                 "loss_img_recon": loss_img_recon,
                 "z_reg": torch.mean(zs**2),
+                "repulsion_loss": max_first_dist_loss,
                 "w_loss_multistep_z": z_predict_weight * loss_z,
                 "w_loss_multistep_img": img_predict_weight * loss_img,
                 "w_loss_img_recon": img_recon_weight * loss_img_recon,
                 "w_z_reg": z_reg_weight * torch.mean(zs**2),
+                "w_repulsion_loss": repulsion_weight * max_first_dist_loss,
             },
             "imgs_recon": imgs_recon,
             "imgs_predicted": imgs_predicted,
