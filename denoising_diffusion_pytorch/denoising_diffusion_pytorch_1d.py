@@ -23,7 +23,7 @@ from tqdm.auto import tqdm
 
 from denoising_diffusion_pytorch.version import __version__
 from torch.nn.utils import clip_grad_norm_
-
+from torch.optim.lr_scheduler import LambdaLR
 # constants
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
@@ -293,7 +293,8 @@ class Unet1D(Module):
         sinusoidal_pos_emb_theta = 10000,
         attn_dim_head = 32,
         attn_heads = 4,
-        y_cond = None
+        y_cond = None,
+
     ):
         super().__init__()
 
@@ -429,7 +430,9 @@ class Unet1D(Module):
         x = torch.cat((x, r), dim = 1)
 
         x = self.final_res_block(x, t)
-        return self.final_conv(x)
+
+        out = self.final_conv(x)
+        return out
 
 # gaussian diffusion trainer class
 
@@ -766,6 +769,7 @@ class GaussianDiffusion1D(Module):
 
 # trainer class
 
+
 class Trainer1D(object):
     def __init__(
         self,
@@ -787,11 +791,15 @@ class Trainer1D(object):
         split_batches = True,
         max_grad_norm = 1.,
         callback = None,
-        device = torch.device('cpu')
+        device = torch.device('cpu'),
+        noise_y = 1e-2,
+        noise_z = 1e-3
     ):
         super().__init__()
         self.callback = callback
         self.device = device
+        self.noise_y = noise_y
+        self.noise_z = noise_z
 
         # accelerator
 
@@ -829,6 +837,31 @@ class Trainer1D(object):
 
         self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
 
+        # =================== Learning Rate Scheduler ===================
+        # Define the learning rate scheduler here
+
+        # Total number of training steps
+        total_steps = self.train_num_steps
+
+        # Calculate the number of steps for each phase
+        ramp_up_steps = int(0.25 * total_steps)    # 25% of training steps
+        ramp_down_steps = int(0.25 * total_steps)  # Next 25% of training steps
+        steady_steps = total_steps - ramp_up_steps - ramp_down_steps  # Remaining steps
+
+        def lr_lambda(current_step):
+            if current_step < ramp_up_steps:
+                # Ramp up from 0 to 10x LR
+                return 10.0 * current_step / ramp_up_steps
+            elif current_step < ramp_up_steps + ramp_down_steps:
+                # Ramp down from 10x LR to base LR
+                return 10.0 - 9.0 * (current_step - ramp_up_steps) / ramp_down_steps
+            else:
+                # Maintain base LR
+                return 1.0
+
+        self.scheduler = LambdaLR(self.opt, lr_lambda=lr_lambda)
+        # =================================================================
+
         # for logging results in a folder periodically
 
         # if self.accelerator.is_main_process:
@@ -858,6 +891,7 @@ class Trainer1D(object):
             'step': self.step,
             'model': self.model.state_dict(),
             'opt': self.opt.state_dict(),
+            'scheduler': self.scheduler.state_dict(),  # Save scheduler state
             'ema': self.ema.state_dict(),
             # 'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__
@@ -876,6 +910,7 @@ class Trainer1D(object):
 
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
+        self.scheduler.load_state_dict(data['scheduler'])  # Load scheduler state
         # if self.accelerator.is_main_process:
         self.ema.load_state_dict(data["ema"])
 
@@ -891,34 +926,26 @@ class Trainer1D(object):
 
         # with tqdm(initial = self.step, total = self.train_num_steps) as pbar:
 
-
         while self.step < self.train_num_steps:
             self.model.train()
 
-            total_loss = 0.
+            batch = next(self.dl)
+            data_xu = batch["xu"].to(device)
+            data_y = batch["y"].to(device)
 
-            # for _ in range(self.gradient_accumulate_every):
-            data_xu = next(self.dl)["xu"].to(device)
-            data_y = next(self.dl)["y"].to(device)
+
+
             assert data_y.shape[0] == data_xu.shape[0], 'data_y and data_xu must have the same batch size'
+            loss = self.model(data_xu + torch.randn_like(data_xu) * self.noise_z,  y=data_y + torch.randn_like(data_y) * self.noise_y)
 
-            # with self.accelerator.autocast():
-            loss = self.model(data_xu, y=data_y)
-            loss = loss / self.gradient_accumulate_every
-            total_loss += loss.item()
-
-            # self.accelerator.
-            loss.backward()
-                # backward(loss)
-
-            # pbar.set_description(f'loss: {total_loss:.4f}')
-            #
-            # accelerator.wait_for_everyone()
-            # accelerator.
-            clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
-            self.opt.step()
             self.opt.zero_grad()
+            loss.backward()
+            clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.opt.step()
+
+            # =================== Update Learning Rate ===================
+            self.scheduler.step()
+            # =================================================================
 
             # accelerator.wait_for_everyone()
 
@@ -927,42 +954,18 @@ class Trainer1D(object):
             self.ema.update()
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                print(f'step: {self.step} / {self.train_num_steps}, loss: {total_loss:.4f}')
+                print(f'step: {self.step} / {self.train_num_steps}, loss: {loss.item():.4f}')
+
+                # Optional: Print current learning rate
+                current_lr = self.scheduler.get_last_lr()[0]  # Assuming single param group
+                print(f'Current Learning Rate: {current_lr:.6f}')
+
                 self.ema.ema_model.eval()
 
                 milestone = self.step // self.save_and_sample_every
-                # with torch.no_grad():
-                #     milestone = self.step // self.save_and_sample_every
-                    # batches = num_to_groups(self.num_samples, self.batch_size)
-                    # all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n,
-                    #                                                                 y = data_y[:n] if data_y is not None else None), batches))
-                    # all-
-                #
-                #     all_samples = self.ema.ema_model.sample(
-                #         batch_size=self.num_samples,
-                #         y = data_y[:self.num_samples] if data_y is not None else None)
-                #
-                #     # lets get the first 5 ys and repeat interleave 
-                #     y = data_y[:5].repeat_interleave(4, dim = 0)
-                #     all_samples_cond = self.ema.ema_model.sample(
-                #         batch_size=y.shape[0],
-                #         y = y)
-                #
-                #
-                # # all_samples = torch.cat(all_samples_list, dim = 0)
-                #
-                # if self.callback is not None:
-                #     self.callback(all_samples, milestone)
-                #     self.callback()
 
                 # torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
                 if self.callback is not None:
-                    self.callback(self.ema.ema_model,milestone)
+                    self.callback(self.ema.ema_model, milestone)
                 self.save(milestone)
 
-
-
-
-            # pbar.update(1)
-
-        # accelerator.print('training complete')

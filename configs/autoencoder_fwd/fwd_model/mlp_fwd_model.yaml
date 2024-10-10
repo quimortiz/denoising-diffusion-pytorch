@@ -1,0 +1,6 @@
+model:
+  _target_: train_fwd_images.MLPForwardModel  # Replace with actual path
+  hidden_dim: 128
+  nz: ${nz}
+  nu: ${nu}
+  num_layers: 4

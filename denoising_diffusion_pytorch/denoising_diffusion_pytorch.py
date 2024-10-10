@@ -35,6 +35,7 @@ from torch.nn.utils import clip_grad_norm_
 import sys
 sys.path.append( "/home/quim/code/resnet-18-autoencoder/src/")
 
+from torch.optim.lr_scheduler import LambdaLR
 # from classes.resnet_autoencoder import AE
 
 # from scripts.utils import (
@@ -1294,38 +1295,39 @@ class Dataset(Dataset):
 
 
 
+# trainer class
+
 class TrainerMLP:
     def __init__(
         self,
         diffusion_model,
         folder,
         *,
-        train_batch_size = 16,
-        gradient_accumulate_every = 1,
-        augment_horizontal_flip = True,
-        train_lr = 1e-4,
-        train_num_steps = 100000,
-        ema_update_every = 10,
-        ema_decay = 0.995,
-        adam_betas = (0.9, 0.99),
-        save_and_sample_every = 10,
-        num_samples = 25,
-        results_folder = './results',
-        amp = False,
-        mixed_precision_type = 'fp16',
-        split_batches = True,
-        convert_image_to = None,
-        calculate_fid = True,
-        inception_block_idx = 2048,
-        max_grad_norm = 1.,
-        num_fid_samples = 50000,
-        save_best_and_latest_only = False,
-        dataset= None,
+        train_batch_size=16,
+        gradient_accumulate_every=1,
+        augment_horizontal_flip=True,
+        train_lr=1e-4,
+        train_num_steps=100000,
+        ema_update_every=10,
+        ema_decay=0.995,
+        adam_betas=(0.9, 0.99),
+        save_and_sample_every=10,
+        num_samples=25,
+        results_folder='./results',
+        amp=False,
+        mixed_precision_type='fp16',
+        split_batches=True,
+        convert_image_to=None,
+        calculate_fid=True,
+        inception_block_idx=2048,
+        max_grad_norm=1.0,
+        num_fid_samples=50000,
+        save_best_and_latest_only=False,
+        dataset=None,
         image_model=None,
-        id = "000",
-        device = torch.device("cpu"),
+        id="000",
+        device=torch.device("cpu"),
         callback=None
-
     ):
         super().__init__()
         self.image_model = image_model
@@ -1336,8 +1338,8 @@ class TrainerMLP:
         # accelerator
 
         # self.accelerator = Accelerator(
-        #     split_batches = split_batches,
-        #     mixed_precision = mixed_precision_type if amp else 'no'
+        #     split_batches=split_batches,
+        #     mixed_precision=mixed_precision_type if amp else 'no'
         # )
 
         # model
@@ -1374,27 +1376,52 @@ class TrainerMLP:
             self.ds = dataset
 
         else:
-            self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+            self.ds = Dataset(folder, self.image_size, augment_horizontal_flip=augment_horizontal_flip, convert_image_to=convert_image_to)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=cpu_count())
 
         # dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
         # optimizer
 
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+        self.opt = Adam(diffusion_model.parameters(), lr=train_lr, betas=adam_betas)
+
+        # =================== Learning Rate Scheduler ===================
+        # Define the learning rate scheduler here
+
+        # Total number of training steps
+        total_steps = self.train_num_steps
+
+        # Calculate the number of steps for each phase
+        ramp_up_steps = int(0.25 * total_steps)    # 25% of training steps
+        ramp_down_steps = int(0.25 * total_steps)  # Next 25% of training steps
+        steady_steps = total_steps - ramp_up_steps - ramp_down_steps  # Remaining steps
+
+        def lr_lambda(current_step):
+            if current_step < ramp_up_steps:
+                # Ramp up from 0 to 10x LR
+                return 10.0 * current_step / ramp_up_steps
+            elif current_step < ramp_up_steps + ramp_down_steps:
+                # Ramp down from 10x LR to base LR
+                return 10.0 - 9.0 * (current_step - ramp_up_steps) / ramp_down_steps
+            else:
+                # Maintain base LR
+                return 1.0
+
+        self.scheduler = LambdaLR(self.opt, lr_lambda=lr_lambda)
+        # =================================================================
 
         # for logging results in a folder periodically
 
         # if self.accelerator.is_main_process:
-        self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+        self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
         self.ema.to(self.device)
 
         self.results_folder = Path(results_folder)
-        self.results_folder.mkdir(exist_ok = True)
+        self.results_folder.mkdir(exist_ok=True)
 
         # step counter state
 
@@ -1447,6 +1474,7 @@ class TrainerMLP:
             'step': self.step,
             'model': self.model.state_dict(),
             'opt': self.opt.state_dict(),
+            'scheduler': self.scheduler.state_dict(),  # Save scheduler state
             'ema': self.ema.state_dict(),
             # 'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__
@@ -1466,6 +1494,7 @@ class TrainerMLP:
 
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
+        self.scheduler.load_state_dict(data['scheduler'])  # Load scheduler state
         # if self.accelerator.is_main_process:
         self.ema.load_state_dict(data["ema"])
 
@@ -1479,37 +1508,44 @@ class TrainerMLP:
         # accelerator = self.accelerator
         device = self.device
 
-
         while self.step < self.train_num_steps:
             self.model.train()
 
-            total_loss = 0.
+            total_loss = 0.0
 
+            # Data Retrieval
             if self.dataset is not None:
                 data = next(self.dl)[0].to(device)
             else:
                 data = next(self.dl).to(device)
 
+            # Forward Pass
             # with self.accelerator.autocast():
             loss = self.model(data)
-            loss = loss 
             total_loss += loss.item()
 
+            # Backward Pass and Optimization
             self.opt.zero_grad()
             loss.backward()
-                # .backward(loss)
-
-
             clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
             self.opt.step()
+
+            # =================== Update Learning Rate ===================
+            self.scheduler.step()
+            # =================================================================
 
             self.step += 1
             # if accelerator.is_main_process:
             self.ema.update()
 
+            # Checkpointing and Sampling
             if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
-                print(f'step {self.step} / {self.train_num_steps}, loss: {total_loss}')
+                print(f'step {self.step} / {self.train_num_steps}, loss: {total_loss:.4f}')
+
+                # Optional: Print current learning rate
+                current_lr = self.scheduler.get_last_lr()[0]  # Assuming single param group
+                print(f'Current Learning Rate: {current_lr:.6f}')
+
                 self.ema.ema_model.eval()
 
                 milestone = self.step // self.save_and_sample_every
@@ -1518,9 +1554,9 @@ class TrainerMLP:
                     self.callback(self.ema.ema_model, milestone)
                 self.save(milestone)
 
-            # pbar.update(1)
-
         print('training complete')
+
+
 
 
 
