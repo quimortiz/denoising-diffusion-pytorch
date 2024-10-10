@@ -143,12 +143,13 @@ class ResnetVAE(BaseModel):
 class VanillaVAE(BaseModel):
 
     def __init__(self,
-                 in_channels: int,
                  latent_dims: int,
+                 in_channels: int = 3,
                  hidden_dims: List[int] = None,
                  flow_check=False,
                  size = 64,
-                 **kwargs) -> None:
+                 weights = None
+                 ) -> None:
         """Instantiates the VAE model
 
         Params:
@@ -222,6 +223,14 @@ class VanillaVAE(BaseModel):
                       kernel_size=3, padding=1),
             nn.Sigmoid()
         )
+
+
+        # if weights is not None:
+        #     print("loaded weights from ", weights)
+        #     import pickle
+        #     data = pickle.load(open(weights, "rb"))
+        #     self.load_state_dict(data["vision_state_dict"])
+        #     self.eval()
 
     def encode(self, input: Tensor) -> List[Tensor]:
         """
