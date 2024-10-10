@@ -1,0 +1,6 @@
+model:
+  _target_: classes.resnet_autoencoder.AE  # Replace with actual path
+  network: light
+  nz: ${nz}
+  # pretrained: false
+  # pretrained_path: ""  # Define if pretrained is true

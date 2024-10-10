@@ -9,6 +9,7 @@ import string
 import pathlib
 import sys
 import datetime
+import wandb
 
 # Add custom module paths
 sys.path.append("resnet-18-autoencoder/src")  # Adjust as needed
@@ -207,7 +208,6 @@ class TrajectoryDatasetDisk(Dataset):
         return data
 
 
-
 def generate_exp_id():
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
 
@@ -220,6 +220,12 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 )
 def main(config: DictConfig):
     print("Configuration:\n", OmegaConf.to_yaml(config))
+
+    # [wandb] Initialize wandb
+    wandb.init(
+        project=config.wandb.project_name,
+        config=OmegaConf.to_container(config, resolve=True),
+    )
 
     # Set random seed for reproducibility
     random_seed = config.training.seed
@@ -237,48 +243,11 @@ def main(config: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vision_model = vision_model.to(device)
 
-    # data_in = to_absolute_path(config.data_path)
-    # data_in = torch.load(data_in)
-    # imgs = data_in["imgs"]
-    # us = data_in["us"]
-    # xs = data_in["xs"]
-
     data_folder = config.data_folder
 
     # get how many files are in data_folder
     num_trajs = len(list(pathlib.Path(data_folder).rglob("*.pt")))
     print(num_trajs, "num_trajs")
-
-
-    # for i in range(len(imgs)):
-    #     fileout = data_folder + f"/traj_{i:05d}.pt"
-    #     pathlib.Path(fileout).parent.mkdir(parents=True, exist_ok=True)
-    #     print("saving to ", fileout)
-    #     torch.save(
-    #         {
-    #             "imgs": imgs[i].clone(),
-    #             "us": us[i].clone(),
-    #             "xs": xs[i].clone(),
-    #         },
-    #         fileout
-    #     )
-
-    # sys.exit()
-    # imgs = imgs[:, ::2 , ...].clone()
-    # us = us[:, ::2 , ...].clone()
-    # xs = xs[:, ::2 , ...].clone()
-    #
-    # torch.save(
-    #     {
-    #         "imgs": imgs,
-    #         "us": us,
-    #         "xs": xs,
-    #
-    #     },
-    #     config.data_path + "_downsampled.pt",
-    # )
-    #
-    # sys.exit()
 
     num_trajectories = num_trajs
 
@@ -295,25 +264,13 @@ def main(config: DictConfig):
     test_indices = indices[train_size:]
 
     # Create Dataset instances
+    train_dataset = TrajectoryDatasetDisk(
+        data_folder, [f"{data_folder}/traj_{i:05d}.pt" for i in train_indices]
+    )
 
-    # train_dataset = TrajectoryDataset(
-    #     imgs=imgs[train_indices],
-    #     xs=xs[train_indices],
-    #     us=us[train_indices],
-    # )
-
-
-    train_dataset = TrajectoryDatasetDisk(data_folder, [f"{data_folder}/traj_{i:05d}.pt" for i in train_indices])
-
-    test_dataset = TrajectoryDatasetDisk(data_folder, [f"{data_folder}/traj_{i:05d}.pt" for i in test_indices])
-
-    # test_dataset = TrajectoryDataset(
-    #     imgs=imgs[test_indices],
-    #     xs=xs[test_indices],
-    #     us=us[test_indices],
-    # )
-
-    # del imgs, xs, us, data_in
+    test_dataset = TrajectoryDatasetDisk(
+        data_folder, [f"{data_folder}/traj_{i:05d}.pt" for i in test_indices]
+    )
 
     # Create DataLoader instances
     dataloader_train = DataLoader(
@@ -375,6 +332,17 @@ def main(config: DictConfig):
 
     # Initialize TensorBoard SummaryWriter
     writer = SummaryWriter(log_dir=to_absolute_path(f"runs/{exp_id}__{time_stamp}"))
+
+    # [wandb] Log hyperparameters
+    wandb.config.update(
+        OmegaConf.to_container(config.training, resolve=True), allow_val_change=True
+    )
+    wandb.config.update(
+        OmegaConf.to_container(config.fwd_model, resolve=True), allow_val_change=True
+    )
+    wandb.config.update(
+        OmegaConf.to_container(config.vision_model, resolve=True), allow_val_change=True
+    )
 
     img_recon_weight = config.training.img_recon
     img_predict_weight = config.training.img_predict
@@ -470,19 +438,19 @@ def main(config: DictConfig):
 
         sequence_length = imgs.shape[1]
 
-        fout = results_folder / f"imgs/orig-imgs-{tag}.png"
+        fout = results_folder / f"imgs/orig-imgs-{tag}-e{epoch:05d}.png"
         utils.save_image(
             rearrange(imgs, "b seq ... -> (b seq) ..."), fout, nrow=sequence_length
         )
 
-        fout = results_folder / f"imgs/recon-imgs-{tag}.png"
+        fout = results_folder / f"imgs/recon-imgs-{tag}-e{epoch:05d}.png"
         utils.save_image(
             rearrange(imgs_recon, "b seq ... -> (b seq) ..."),
             fout,
             nrow=sequence_length,
         )
 
-        fout = results_folder / f"imgs/predicted-imgs-{tag}.png"
+        fout = results_folder / f"imgs/predicted-imgs-{tag}-e{epoch:05d}.png"
         utils.save_image(
             rearrange(imgs_predicted, "b seq ... -> (b seq) ..."),
             fout,
@@ -511,6 +479,16 @@ def main(config: DictConfig):
         writer.add_image(f"Reconstructed Images/{tag}", grid_recon, global_step=epoch)
         writer.add_image(f"Predicted Images/{tag}", grid_pred, global_step=epoch)
 
+        # [wandb] Log images to wandb
+        wandb.log(
+            {
+                f"Original Images/{tag}": wandb.Image(grid_orig.cpu()),
+                f"Reconstructed Images/{tag}": wandb.Image(grid_recon.cpu()),
+                f"Predicted Images/{tag}": wandb.Image(grid_pred.cpu()),
+            },
+            step=epoch,
+        )
+
     for epoch in range(num_epochs):
 
         forward_model.train()  # Ensure model is in training mode
@@ -530,9 +508,9 @@ def main(config: DictConfig):
             optimizer.step()
 
             # Logging
-            if batch_idx % 1000 == 0:
+            if batch_idx == 0:
                 print(
-                    f"Epoch {epoch+1}/{num_epochs} -- batch {batch_idx+1}/{len(dataloader_train)} Train set"
+                    f"Epoch {epoch}/{num_epochs} -- batch {batch_idx+1}/{len(dataloader_train)} Train set"
                 )
                 loss_info(out["loss"])
 
@@ -544,6 +522,15 @@ def main(config: DictConfig):
                         epoch * len(dataloader_train) + batch_idx,
                     )
 
+                # [wandb] Log training losses to wandb
+                wandb.log(
+                    {
+                        f"Train/{loss_name}": loss_value.item()
+                        for loss_name, loss_value in out["loss"].items()
+                    },
+                    step=epoch,
+                )
+
         # Get a batch from the test set.
         vision_model.eval()
         forward_model.eval()
@@ -554,22 +541,25 @@ def main(config: DictConfig):
                 infos.append(out["loss"])
 
             info = mean_of_dicts(infos)
-            print(f"Epoch {epoch+1}/{num_epochs} -- test set")
+            print(f"Epoch {epoch}/{num_epochs} -- test set")
             loss_info(info)
 
             # Log test losses to TensorBoard
             for loss_name, loss_value in info.items():
-                writer.add_scalar(f"Test/{loss_name}", loss_value.item(), epoch + 1)
+                writer.add_scalar(f"Test/{loss_name}", loss_value.item(), epoch)
+
+                # [wandb] Log test losses to wandb
+                wandb.log({f"Test/{loss_name}": loss_value.item()}, step=epoch)
 
             # Save and log images with epoch number
             out_train = compute(train_small_eval)
-            save_images(out_train, f"train-e{epoch+1:05d}", epoch + 1)
+            save_images(out_train, f"train", epoch)
 
             out_test = compute(test_small_eval)
-            save_images(out_test, f"test-e{epoch+1:05d}", epoch + 1)
+            save_images(out_test, f"test", epoch)
 
         # Save model checkpoint
-        fout = results_folder / f"checkpoints/model-epoch-{epoch+1:05d}.pt"
+        fout = results_folder / f"checkpoints/model-epoch-{epoch:05d}.pt"
         torch.save(
             {
                 "fwd_state_dict": forward_model.state_dict(),
@@ -579,6 +569,14 @@ def main(config: DictConfig):
             },
             str(fout),
         )
+
+        # [wandb] Optionally, save checkpoints as wandb artifacts
+        # Uncomment the following lines if you want to track model checkpoints in wandb
+        """
+        artifact = wandb.Artifact('model_checkpoint', type='model')
+        artifact.add_file(str(fout))
+        wandb.log_artifact(artifact)
+        """
 
     print("Training completed!")
 
@@ -591,12 +589,18 @@ def main(config: DictConfig):
         "final_z_reg": info["z_reg"].item(),
     }
 
+    # [wandb] Log final metrics
+    wandb.log(metric_dict)
+
     writer.add_hparams(
         OmegaConf.to_container(config.training, resolve=True), metric_dict
     )
 
     # Close the TensorBoard writer
     writer.close()
+
+    # [wandb] Finish the wandb run
+    wandb.finish()
 
 
 if __name__ == "__main__":

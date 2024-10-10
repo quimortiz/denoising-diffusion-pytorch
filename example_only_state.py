@@ -77,7 +77,7 @@ diffusion = GaussianDiffusionMLP(
     # image_size = 64,
     beta_schedule = 'cosine',
     timesteps = 100,    # number of steps
-    # auto_normalize= False
+    auto_normalize= False
 )
 
 
@@ -133,6 +133,7 @@ if args.pretrained:
         # vision_model = torch.load(path)['model_full']
         print('loading model from ', path, '...')
         vision_model.load_state_dict(torch.load(path)['model'])
+        vision_model.eval()
 
 
 
@@ -143,10 +144,11 @@ vision_model = vision_model.to(device)
 
 print("encoding data...")
 with torch.no_grad():
-    for traj in my_data_resized[:100]:
+    for traj in my_data_resized:
         traj_latent = vision_model.encode(traj.to(device))[0]
         trajs_latent.append(traj_latent.cpu())
 
+del my_data_resized
 trajs_latent = torch.stack(trajs_latent)
 
 # rearrange to (B, channels, seq)
@@ -179,12 +181,13 @@ def callback(model, milestone):
 
 
 
+print("training...")
 trainer = TrainerMLP(
     diffusion,
     folder=None,
     train_batch_size = 32,
     train_lr = 5*1e-4,
-    train_num_steps = int(1e6),         # total training steps
+    train_num_steps = int(1e7),         # total training steps
     save_and_sample_every = 5000,
     ema_decay = 0.995,                # exponential moving average decay
     amp = False,                       # turn on mixed precision

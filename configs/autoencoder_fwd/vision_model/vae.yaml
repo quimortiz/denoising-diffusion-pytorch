@@ -1,0 +1,5 @@
+model:
+  _target_: train_fwd_images.VanillaVAE
+  in_channels: 3
+  latent_dims: ${nz}
+  size: ${image_size}

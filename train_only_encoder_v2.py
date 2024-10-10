@@ -100,6 +100,12 @@ parser.add_argument(
 parser.add_argument("--noise_z", type=float, default=1e-2, help="X")
 parser.add_argument("--noise_img", type=float, default=1e-2, help="X")
 parser.add_argument("--z_dim", type=int, default=8, help="X")
+parser.add_argument(
+    "--max_first_dist_weight",
+    type=float,
+    default=1e-10,
+    help="Weight for maximizing the distance between the first states in a batch",
+)
 
 args = parser.parse_args()
 
@@ -281,7 +287,6 @@ vision_model.load_state_dict(torch.load(fout)["model"])
 
 for i in range(args.train_num_steps):
     batch = next(dl)
-    # print(f"batch {batch['imgs'].shape}")
     vision_model.train()
     imgs = batch["imgs"].to(device)
     imgs = rearrange(imgs, "b n c h w -> (b n) c h w")
@@ -294,55 +299,45 @@ for i in range(args.train_num_steps):
     z_raw, _, _ = vision_model.encode(input_imgs)
     z_raw = z_raw + (2 * torch.rand_like(z_raw) - 1) * args.noise_z
     z_norms = torch.max(z_raw.norm(dim=-1, keepdim=True), torch.tensor(1e-5).to(device))
-    # normalize the z
-    # z = z_raw / z_norms
     z = z_raw
-    # z_loss = torch.mean((torch.ones_like(z_norms) - z_norms) ** 2)
     z_loss = torch.mean(z**2)
     fake_imgs = vision_model.decode(z)
     img_loss = F.mse_loss(fake_imgs, imgs, reduction="mean")
-    # z_loss = torch.mean(z ** 2)
     z_traj = rearrange(z, "(b n) c -> b n c", b=train_batch_size)
 
-    # Compute z_traj_loss (difference between consecutive latent codes)
+    # Existing loss terms
     z_traj_loss = torch.mean(
         torch.sum((z_traj[:, 1:, :] - z_traj[:, :-1, :]) ** 2, dim=-1)
     )
 
-    # Compute z_interp_loss (difference from linear interpolation)
     b = z_traj.shape[0]
     n = z_traj.shape[1]
-    z_first = z_traj[:, 0, :]  # shape (b, c)
-    z_last = z_traj[:, -1, :]  # shape (b, c)
-    t = torch.arange(n, device=z_traj.device).float() / (n - 1)  # shape (n,)
-    t = t.unsqueeze(0).unsqueeze(-1)  # shape (1, n, 1)
-    z_interp = (
-        z_first.unsqueeze(1) + (z_last - z_first).unsqueeze(1) * t
-    )  # shape (b, n, c)
+    z_first = z_traj[:, 0, :]
+    z_last = z_traj[:, -1, :]
+    t = torch.arange(n, device=z_traj.device).float() / (n - 1)
+    t = t.unsqueeze(0).unsqueeze(-1)
+    z_interp = z_first.unsqueeze(1) + (z_last - z_first).unsqueeze(1) * t
     z_interp_loss = torch.mean((z_traj - z_interp) ** 2)
-
-    # Compute image interpolation loss
-    # imgs_traj = rearrange(imgs, "(b n) c h w -> b n c h w", b=train_batch_size)
 
     img_interp_loss = torch.tensor(0.0)
     if args.img_interp_weight > 1e-12:
         img_interp = vision_model.decode(rearrange(z_interp, "b n c -> (b n) c"))
         img_interp_loss = F.mse_loss(imgs, img_interp, reduction="mean")
 
-    # fake_imgs_traj = rearrange(fake_imgs, "(b n) c h w -> b n c h w", b=train_batch_size)
-    # imgs_first = imgs_traj[:, 0, :, :, :]  # shape (B, C, H, W)
-    # imgs_last = imgs_traj[:, -1, :, :, :]  # shape (B, C, H, W)
-    # t_img = t.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # shape (1, n, 1, 1, 1)
-    # imgs_interp = imgs_first.unsqueeze(1) + (imgs_last - imgs_first).unsqueeze(1) * t_img  # shape (B, N, C, H, W)
-    # img_interp_loss = F.mse_loss(fake_imgs_traj, imgs_interp, reduction="mean")
+    # New loss term: Maximize distance between first states
+    distances = torch.cdist(z_first, z_first, p=2)
+    mask = ~torch.eye(z_first.size(0), device=device).bool()
+    avg_distance = distances[mask].mean()
+    max_first_dist_loss = -avg_distance  # Negative for maximization
 
-    # Total loss including the new img_interp_loss
+    # Total loss
     total_loss = (
         img_loss
         + args.z_weight * z_loss
         + args.z_diff * z_traj_loss
         + args.z_interp_weight * z_interp_loss
         + args.img_interp_weight * img_interp_loss
+        + args.max_first_dist_weight * max_first_dist_loss  # New term
     )
 
     opt.zero_grad()
@@ -354,11 +349,11 @@ for i in range(args.train_num_steps):
         print("Average z norm", z_raw.norm(dim=-1).mean().item())
         print(
             "Raw loss:",
-            f"img_loss {img_loss.item()} z_loss {z_loss.item()} z_traj_loss {z_traj_loss.item()} z_interp_loss {z_interp_loss.item()} img_interp_loss {img_interp_loss.item()}",
+            f"img_loss {img_loss.item()} z_loss {z_loss.item()} z_traj_loss {z_traj_loss.item()} z_interp_loss {z_interp_loss.item()} img_interp_loss {img_interp_loss.item()} max_first_dist_loss {max_first_dist_loss.item()}",
         )
         print(
             "Weighted Loss:",
-            f"img_loss {img_loss.item()} z_loss {args.z_weight * z_loss.item()} z_traj_loss {args.z_diff * z_traj_loss.item()} z_interp_loss {args.z_interp_weight * z_interp_loss.item()} img_interp_loss {args.img_interp_weight * img_interp_loss.item()}",
+            f"img_loss {img_loss.item()} z_loss {args.z_weight * z_loss.item()} z_traj_loss {args.z_diff * z_traj_loss.item()} z_interp_loss {args.z_interp_weight * z_interp_loss.item()} img_interp_loss {args.img_interp_weight * img_interp_loss.item()} max_first_dist_loss {args.max_first_dist_weight * max_first_dist_loss.item()}",
         )
     if i % 10000 == 0:
         seq_length = plot_data.shape[1]
