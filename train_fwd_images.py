@@ -212,6 +212,10 @@ def generate_exp_id():
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
 
 
+exp_id = generate_exp_id()
+print("experiment id: ", exp_id)
+
+
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
@@ -320,8 +324,6 @@ def main(config: DictConfig):
     forward_model.train()
     vision_model.train()
 
-    exp_id = generate_exp_id()
-    print("experiment id: ", exp_id)
 
     # get time stamp in format YYYY-MM-DD--HH-MM-SS
     time_stamp = datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S")
