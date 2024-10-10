@@ -283,3 +283,27 @@ t
 there was bug and z dim is still 8.
 last step is step 572000 
 
+# Oct 10
+
+python -m pdb  train_only_encoder_v2.py --z_diff 1e-4   --z_weight 5e-4  --size 64   --train_num_steps 1000000 --resnet --img_interp_weight 1e-1  --z_interp_weight 1e-4  --noise_z .05  --z_dim 12 --max_first_dist_weight 1e-3 
+
+Weighted Loss: img_loss 0.00017861477681435645 z_loss 0.014023765563964844 z_traj_loss 0.006280378341674805 z_interp_loss 8.724643588066102e-05 img_interp_loss 5.1982
+991863042116e-05 max_first_dist_loss -0.040341148376464846
+
+saving to results/t54qi3/original-990000.png
+saving to results/t54qi3/recon-990000.png
+saving to results/t54qi3/interp-990000.png
+
+Average z norm 16.5531005859375
+the average first distance is too high!!
+
+
+## new autoencoder
+
+unique-fog-55  is fine!
+
+sunny-firefly-4 is with Autoencoder.
+
+lucky-moon-3 is also ok.
+
+
